@@ -91,6 +91,34 @@ class ConversionTests(unittest.TestCase):
         self.assertIn("\u2610 step", md2docx.convert("1. [ ] step"))
         self.assertIn("[x]y", md2docx.convert("- [x]y no space"))   # needs '[x] ' prefix
 
+    def test_bare_and_leading_checkboxes_in_every_block(self):
+        G, X = "\u2610", "\u2611"
+        cases = {"- [ ]": G, "1. [x]": X, "> [ ] Confirm prerequisites": G + " Confirm",
+                 "[x] done": X + " done", "## [ ] todo": G + " todo"}
+        for md, expected in cases.items():
+            self.assertIn(expected, md2docx.convert(md), md)
+        cell = md2docx.convert("| H | I |\n|---|---|\n| [ ] pending | [x] |")
+        self.assertIn(G + " pending", cell)
+        self.assertIn(X, cell)
+        for literal in ("[x](http://example.com)", "- [x]y", "Status [x] mid-text"):
+            out = md2docx.convert(literal)
+            self.assertNotIn(G, out, literal)
+            self.assertNotIn(X, out, literal)
+
+    def test_genuinely_wider_rows_are_not_merged(self):
+        xml_ = md2docx.convert("| A | B |\n|---|---|\n| 1 | 2 | 3 |")
+        self.assertEqual(xml_.count("<w:gridCol "), 3)          # table grows, as before round 3
+        self.assertNotIn("2|3", xml_)
+        self.assertIn(">3</w:t>", xml_)
+
+    def test_four_space_indented_hash_is_not_a_heading_or_title(self):
+        md = "    # install deps\n# Real Title\nBody\n"
+        out = md2docx.strip_title(md)
+        self.assertIn("    # install deps", out)
+        self.assertNotIn("Real Title", out)
+        self.assertNotIn("Heading", md2docx.convert("    # install deps"))
+        self.assertIn('w:val="Heading1"', md2docx.convert("   # three spaces is still a heading"))
+
     def test_indented_title_is_removed(self):
         out = md2docx.strip_title("  # Indented Title\nBody\n")
         self.assertNotIn("Indented Title", out)

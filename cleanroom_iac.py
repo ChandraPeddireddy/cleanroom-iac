@@ -201,7 +201,13 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
     bad_defaults: Dict[str, str] = {}
     used_bad_defaults = set()
     for key in ("cloud_vendor", "region"):
-        clean_defaults[key], err = _clean_setting(defaults.get(key))
+        value, err = _clean_setting(defaults.get(key))
+        if not err and value is not None:
+            if key == "cloud_vendor" and value not in CLOUD_VENDORS:
+                err = f"must be one of {list(CLOUD_VENDORS)} (got {value!r})"
+            elif key == "region" and not REGION_RE.match(value):
+                err = f"is not a valid region identifier (got {value!r})"
+        clean_defaults[key] = None if err else value
         if err:
             bad_defaults[key] = f"defaults: '{key}' {err}"
 
@@ -341,7 +347,12 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
         # nothing is derived from the workspace metastore. Supported regions are decided by the API.
         cloud_vendor, cloud_err = _setting(r, clean_defaults, "cloud_vendor")
         region, region_err = _setting(r, clean_defaults, "region")
-        if manage_room:  # join-only rooms ignore cloud_vendor / region entirely
+        if not manage_room:
+            # Not used for join-only rooms, but surface typos before the room is ever switched to create: true.
+            for err in (cloud_err, region_err):
+                if err:
+                    warnings.append(f"{where}: {err} (ignored because create: false)")
+        if manage_room:
             skip = set()
             for key, value, err in (("cloud_vendor", cloud_vendor, cloud_err), ("region", region, region_err)):
                 if err:
@@ -446,7 +457,9 @@ class Change:
     detail: str = ""
     status: str = "PLANNED"     # PLANNED | APPLIED | FAILED | SKIPPED
     error: str = ""
-    blocking: bool = False      # True: the room's assets, rules and grants are not planned/applied
+    # True: the room's assets, rules and grants are not planned/applied. Internal only: excluded from
+    # comparison/repr and removed in as_row(), the single serialization point for output rows.
+    blocking: bool = field(default=False, compare=False, repr=False)
     _fn: Optional[Callable[[], None]] = field(default=None, repr=False, compare=False)
 
     def as_row(self) -> dict:
@@ -891,8 +904,6 @@ class CleanRoomManager:
                 live = self._get_room(cfg["name"])
                 room_changes = self._plan_room(cfg, live)
                 changes += room_changes
-                if live is None and not cfg["create"]:
-                    continue
                 if any(c.blocking for c in room_changes):
                     continue
                 changes += self._plan_children(cfg, live if live and live.get("status") == "ACTIVE" else None,
@@ -914,8 +925,6 @@ class CleanRoomManager:
                 self._execute(room_changes)
                 results += room_changes
                 if any(c.status == "FAILED" for c in room_changes):
-                    continue
-                if live is None and not cfg["create"]:
                     continue
                 if any(c.blocking for c in room_changes):
                     continue

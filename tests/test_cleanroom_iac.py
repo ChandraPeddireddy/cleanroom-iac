@@ -277,6 +277,39 @@ class ConfigValidationTests(unittest.TestCase):
             r["region"] = "eastus"
         cr.normalize_config(cfg)
 
+    def test_join_only_bad_types_warn_not_fail(self):
+        cfg = base_config(create=False, collaborators=[], cloud_vendor=True, region=123)
+        rooms, warnings = cr.normalize_config(cfg)
+        self.assertEqual((rooms[0]["cloud_vendor"], rooms[0]["region"]), (None, None))
+        joined = " ".join(warnings)
+        self.assertIn("'cloud_vendor' must be a string", joined)
+        self.assertIn("'region' must be a string", joined)
+        self.assertIn("ignored because create: false", joined)
+
+    def test_misspelled_default_reported_once(self):
+        cfg = base_config(cloud_vendor=None, region=None)
+        for n in range(1, 6):
+            extra = json.loads(json.dumps(cfg["clean_rooms"][0]))
+            extra["name"] = f"room_{n}"
+            cfg["clean_rooms"].append(extra)
+        cfg["defaults"] = {"cloud_vendor": "azrue", "region": "East US"}
+        with self.assertRaises(cr.ConfigError) as ctx:
+            cr.normalize_config(cfg)
+        msg = str(ctx.exception)
+        self.assertEqual(msg.count("defaults: 'cloud_vendor' must be one of"), 1, msg)
+        self.assertEqual(msg.count("defaults: 'region' is not a valid region identifier"), 1, msg)
+        self.assertNotIn("clean room 'room_", msg)            # no per-room repeats
+        for r in cfg["clean_rooms"]:                           # unused bad defaults -> no error
+            r.update(cloud_vendor="azure", region="eastus")
+        cr.normalize_config(cfg)
+
+    def test_blocking_does_not_affect_equality_or_repr(self):
+        a = cr.Change("r", "CLEAN_ROOM", "r", "WARN", "x", blocking=True)
+        b = cr.Change("r", "CLEAN_ROOM", "r", "WARN", "x")
+        self.assertEqual(a, b)
+        self.assertNotIn("blocking", repr(a))
+        self.assertNotIn("blocking", a.as_row())
+
     def test_room_level_bad_value_names_the_room(self):
         with self.assertRaises(cr.ConfigError) as ctx:
             cr.normalize_config(base_config(region=["eastus"]))
