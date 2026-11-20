@@ -1,0 +1,83 @@
+# Clean Rooms as code -- example configuration.
+# One file per environment (dev / uat / prod) kept in Git. Run plan before apply.
+#
+# Placeholders in <angle brackets> must be replaced. Nothing here is a real partner value.
+
+version: 1
+
+defaults:
+  # Clean room owner (local securable owner). Use a GROUP: assets stay shared only while the
+  # owner keeps its privileges on the source tables/volumes/views.
+  owner: "<cleanroom_admins_group>"
+  wait_timeout_minutes: 30
+
+clean_rooms:
+  # ---------------------------------------------------------------------------
+  # Room that THIS metastore creates (create: true is the default).
+  # ---------------------------------------------------------------------------
+  - name: acme_partner_measurement
+    comment: "Acme x Partner measurement clean room (managed by cleanroom_iac; do not edit in UI)"
+    local_alias: acme                 # this metastore's collaborator alias (immutable)
+    # REQUIRED: region of the central clean room. Must be a supported Clean Rooms region, which
+    # can differ from the metastore region (azure/eastus2 is rejected). Azure examples:
+    # eastus, westus, canadacentral, northeurope, westeurope. See the "Create clean rooms" docs.
+    region: eastus
+    # cloud_vendor defaults to this workspace's metastore cloud.
+    # cloud_vendor: azure
+    collaborators:                      # every party except this metastore (immutable after create)
+      - alias: partner
+        # The collaborator's "sharing identifier" (cloud:region:metastore-uuid).
+        global_metastore_id: "azure:<region>:<partner-metastore-uuid>"
+        # Optional invitation target. If you set the email, the workspace id is required too.
+        # REQUIRED when the collaborator is on the SAME metastore as this one (single-metastore room).
+        # invite_recipient_email: "<partner-admin@partner.com>"
+        # invite_recipient_workspace_id: 1234567890123456
+    # enable_shared_output: false
+    # egress_network_policy:            # default when omitted: internet restricted, no destinations
+    #   internet_access:
+    #     restriction_mode: RESTRICTED_ACCESS
+    # output_catalog: acme_partner_measurement_output
+
+    assets:
+      # Shared name defaults to <local_alias>.<schema>.<object>, e.g. acme.cr_demo.members.
+      # Set 'name' explicitly to override (format shared_catalog.shared_schema.asset_name).
+      - type: TABLE
+        local_name: "<catalog>.<schema>.<members_table>"
+      # - type: VIEW
+      #   local_name: "<catalog>.<schema>.<view>"
+      # - type: VOLUME
+      #   local_name: "<catalog>.<schema>.<volume>"
+      - type: NOTEBOOK_FILE
+        name: overlap_analysis          # file name shown in the clean room
+        workspace_path: "/Workspace/Shared/cleanroom_notebooks/overlap_analysis"
+        runner_aliases: [partner]       # who may run it
+        description: "Audience overlap counts with k-anonymity threshold"
+        # environment_version: "2"
+
+    auto_approval_rules:                # rules owned by this metastore
+      # Auto-approve notebooks authored by 'partner' when 'acme' is the runner.
+      - author_alias: partner
+        runner_alias: acme
+      # - author_scope: ANY_AUTHOR
+      #   runner_alias: acme
+
+    grants:                             # UC privileges on the CLEAN_ROOM securable
+      - principal: "<cleanroom_engineers_group>"
+        privileges: [MODIFY_CLEAN_ROOM]
+      - principal: "<cleanroom_analysts_group>"
+        privileges: [EXECUTE_CLEAN_ROOM_TASK]
+
+  # ---------------------------------------------------------------------------
+  # Room created by a PARTNER that this metastore joins. create: false means the tool
+  # never creates or changes the room itself. It manages only this side's assets,
+  # rules and grants once the room appears here.
+  # ---------------------------------------------------------------------------
+  # - name: partner_hosted_room
+  #   create: false
+  #   local_alias: acme                 # must match the alias the creator assigned to you
+  #   assets:
+  #     - type: TABLE
+  #       local_name: "<catalog>.<schema>.<table>"
+  #   grants:
+  #     - principal: "<cleanroom_analysts_group>"
+  #       privileges: [EXECUTE_CLEAN_ROOM_TASK]

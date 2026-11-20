@@ -1,0 +1,380 @@
+"""Offline tests for cleanroom_iac using an in-memory fake of the Clean Rooms / UC REST APIs.
+Run:  python3 -m unittest discover -s tests -v   (from the project folder)"""
+
+import base64
+import json
+import os
+import sys
+import unittest
+import urllib.parse
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import cleanroom_iac as cr  # noqa: E402
+
+LOCAL_GMID = "azure:eastus2:11111111-1111-4111-8111-111111111111"
+PEER_GMID = "aws:us-east-2:22222222-2222-4222-8222-222222222222"
+
+
+class FakeApi:
+    """Minimal stateful fake. Records every call in self.calls."""
+
+    def __init__(self, provision_polls=1):
+        self.rooms, self.assets, self.rules, self.grants, self.files = {}, {}, {}, {}, {}
+        self.calls = []
+        self.provision_polls = provision_polls
+        self._polls = {}
+        self._rule_seq = 0
+        self.fail_on = set()   # (method, path-prefix) pairs that should raise
+        self.caller = "runner@corp.com"
+
+    def __call__(self, method, path, query=None, body=None):
+        self.calls.append((method, path, query, body))
+        for m, p in self.fail_on:
+            if m == method and path.startswith(p):
+                raise cr.ApiError(f"injected failure {method} {path}")
+        parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")]
+        if path == cr.METASTORE_SUMMARY_API:
+            return {"name": "ms", "global_metastore_id": LOCAL_GMID, "cloud": "azure", "region": "eastus2"}
+        if path.startswith("/api/2.0/workspace/"):
+            return self._workspace(method, parts[-1], query, body)
+        if path.startswith(cr.UC_PERMISSIONS_API):
+            name = parts[-1]
+            if name not in self.rooms:
+                raise cr.ApiError(f"Clean Room '{name}' does not exist.", not_found=True)
+            g = self.grants.setdefault(name, {})
+            if method == "GET":
+                return {"privilege_assignments": [{"principal": p, "privileges": sorted(v)} for p, v in g.items() if v]}
+            for ch in body["changes"]:
+                s = g.setdefault(ch["principal"], set())
+                s |= set(ch.get("add", []))
+                s -= set(ch.get("remove", []))
+            return {}
+        # /api/2.0/clean-rooms[/name[/sub...]]
+        rest = parts[3:]
+        if not rest:
+            assert method == "POST"
+            if body.get("owner") not in (None, "", self.caller):
+                raise cr.ApiError("Clean room owner must be empty or match the caller.")
+            name = body["name"]
+            body = dict(body, owner=self.caller)
+            self.rooms[name] = dict(body, status="PROVISIONING", local_collaborator_alias=body["remote_detailed_info"]["collaborators"][0]["collaborator_alias"],
+                                    output_catalog={"status": "NOT_CREATED"})
+            self._polls[name] = 0
+            return {"name": name, "status": "PROVISIONING"}
+        name = rest[0]
+        if name not in self.rooms or self.rooms[name]["status"] == "GONE":
+            raise cr.ApiError(f"Clean room {name} does not exist", not_found=True)
+        room = self.rooms[name]
+        if len(rest) == 1:
+            if method == "GET":
+                if room["status"] == "PROVISIONING":
+                    self._polls[name] += 1
+                    if self._polls[name] > self.provision_polls:
+                        room["status"] = "ACTIVE"
+                return json.loads(json.dumps(room))
+            if method == "PATCH":
+                room.update(body["clean_room"])
+                return room
+            if method == "DELETE":
+                room["status"] = "DELETED"
+                return {}
+        sub = rest[1]
+        if sub == "output-catalogs":
+            room["output_catalog"] = {"status": "CREATED", "catalog_name": body["catalog_name"]}
+            return {}
+        if sub == "assets":
+            a = self.assets.setdefault(name, {})
+            if len(rest) == 2 and method == "GET":
+                return {"assets": [dict(v, notebook=None) for v in a.values()]}
+            if len(rest) == 2 and method == "POST":
+                rec = dict(body, owner_collaborator_alias=room["local_collaborator_alias"], status="ACTIVE")
+                if "notebook" in rec:
+                    rec["notebook"] = dict(rec["notebook"], etag="etag-1")
+                a[(body["asset_type"], body["name"])] = rec
+                return rec
+            key = (rest[2], rest[3])
+            if key not in a:
+                raise cr.ApiError("asset not found", not_found=True)
+            if method == "GET":
+                return a[key]
+            if method == "PATCH":
+                rec = dict(a[key], **body)
+                if "notebook" in rec:
+                    n = int(a[key].get("notebook", {}).get("etag", "etag-0").split("-")[1]) + 1
+                    rec["notebook"] = dict(rec["notebook"], etag=f"etag-{n}")
+                a[key] = rec
+                return rec
+            if method == "DELETE":
+                del a[key]
+                return {}
+        if sub == "auto-approval-rules":
+            r = self.rules.setdefault(name, {})
+            if method == "GET":
+                return {"rules": list(r.values())}
+            if method == "POST":
+                self._rule_seq += 1
+                rid = f"rule-{self._rule_seq}"
+                r[rid] = dict(body["auto_approval_rule"], rule_id=rid,
+                              rule_owner_collaborator_alias=room["local_collaborator_alias"])
+                return r[rid]
+            if method == "DELETE":
+                del r[rest[2]]
+                return {}
+        raise AssertionError(f"unhandled {method} {path}")
+
+    def _workspace(self, method, op, query, body):
+        if op == "export":
+            path = query["path"]
+            if path not in self.files:
+                raise cr.ApiError(f"Path ({path}) doesn't exist.", not_found=True)
+            content = self.files[path]
+            if query.get("format") == "HTML":
+                content = b"<html>" + content + b"</html>"
+            return {"content": base64.b64encode(content).decode()}
+        if op == "import":
+            self.files[body["path"]] = base64.b64decode(body["content"])
+            return {}
+        if op == "mkdirs":
+            return {}
+        raise AssertionError(op)
+
+    def mutations(self):
+        return [(m, p) for m, p, _, _ in self.calls
+                if m != "GET" and not p.startswith("/api/2.0/workspace/")]
+
+
+def base_config(**overrides):
+    room = {
+        "name": "acme_partner",
+        "comment": "managed",
+        "owner": "cr_admins",
+        "local_alias": "acme",
+        "region": "eastus",
+        "collaborators": [{"alias": "partner", "global_metastore_id": PEER_GMID}],
+        "output_catalog": "acme_partner_out",
+        "assets": [
+            {"type": "TABLE", "local_name": "main_catalog.cr_demo.members"},
+            {"type": "NOTEBOOK_FILE", "name": "overlap", "workspace_path": "/Workspace/Shared/nb/overlap",
+             "runner_aliases": ["partner"], "description": "overlap counts"},
+        ],
+        "auto_approval_rules": [{"author_alias": "partner", "runner_alias": "acme"}],
+        "grants": [{"principal": "analysts", "privileges": ["EXECUTE_CLEAN_ROOM_TASK"]},
+                   {"principal": "engineers", "privileges": ["MODIFY CLEAN ROOM"]}],
+    }
+    room.update(overrides)
+    return {"version": 1, "clean_rooms": [room]}
+
+
+def manager(api, cfg=None, state_path="/Workspace/Shared/cr_state/state.json"):
+    rooms, _ = cr.normalize_config(cfg or base_config())
+    return cr.CleanRoomManager(api, rooms, state=cr.WorkspaceFileState(api, state_path),
+                               log=lambda *_: None, sleep=lambda *_: None)
+
+
+def actions(changes):
+    return {(c.resource_type, c.resource): c.action for c in changes}
+
+
+class ConfigValidationTests(unittest.TestCase):
+    def test_valid_config_normalizes_names_and_privileges(self):
+        rooms, warnings = cr.normalize_config(base_config())
+        r = rooms[0]
+        self.assertEqual(r["assets"][0]["name"], "acme.cr_demo.members")  # default shared name
+        self.assertEqual(r["grants"]["engineers"], ["MODIFY_CLEAN_ROOM"])   # "MODIFY CLEAN ROOM" normalized
+        self.assertEqual(warnings, [])
+
+    def test_collects_all_errors(self):
+        bad = base_config(local_alias="", collaborators=[{"alias": "p", "global_metastore_id": "nope",
+                                                          "invite_recipient_email": "a@b.com"}],
+                          assets=[{"type": "TABLE", "local_name": "two.parts"},
+                                  {"type": "NOTEBOOK_FILE", "name": "x"}],
+                          auto_approval_rules=[{"author_alias": "ghost", "runner_alias": "acme"}])
+        with self.assertRaises(cr.ConfigError) as ctx:
+            cr.normalize_config(bad)
+        msg = str(ctx.exception)
+        for fragment in ["local_alias", "cloud:region:metastore-uuid", "invite_recipient_workspace_id",
+                         "catalog.schema.object", "workspace_path", "'ghost'"]:
+            self.assertIn(fragment, msg)
+
+    def test_user_owner_and_unknown_privilege_warn(self):
+        cfg = base_config(owner="someone@corp.com",
+                          grants=[{"principal": "g", "privileges": ["SELECT"]}])
+        _, warnings = cr.normalize_config(cfg)
+        self.assertEqual(len(warnings), 2)
+
+    def test_region_required_for_created_rooms(self):
+        cfg = base_config()
+        del cfg["clean_rooms"][0]["region"]
+        with self.assertRaises(cr.ConfigError) as ctx:
+            cr.normalize_config(cfg)
+        self.assertIn("'region'", str(ctx.exception))
+        cfg["defaults"] = {"region": "westus"}
+        self.assertEqual(cr.normalize_config(cfg)[0][0]["region"], "westus")
+        cr.normalize_config(base_config(create=False, collaborators=[], region=None))
+
+    def test_create_requires_a_collaborator(self):
+        with self.assertRaises(cr.ConfigError):
+            cr.normalize_config(base_config(collaborators=[]))
+        cr.normalize_config(base_config(collaborators=[], create=False))  # join-only is fine
+
+
+class PlanApplyTests(unittest.TestCase):
+    def setUp(self):
+        self.api = FakeApi()
+        self.api.files["/Shared/nb/overlap"] = b"# Databricks notebook source\nprint(1)\n"
+
+    def test_plan_for_new_room_is_read_only_and_complete(self):
+        changes = manager(self.api).plan()
+        self.assertEqual(self.api.mutations(), [])
+        a = actions(changes)
+        self.assertEqual(a[("CLEAN_ROOM", "acme_partner")], "CREATE")
+        self.assertEqual(a[("ASSET", "TABLE acme.cr_demo.members")], "CREATE")
+        self.assertEqual(a[("ASSET", "NOTEBOOK_FILE overlap")], "CREATE")
+        self.assertEqual(a[("GRANT", "analysts")], "CREATE")
+        self.assertEqual(a[("OUTPUT_CATALOG", "acme_partner_out")], "CREATE")
+
+    def test_create_body_uses_runtime_metastore_and_no_creator_email(self):
+        manager(self.api).apply()
+        post = next(b for m, p, _, b in self.api.calls if m == "POST" and p == cr.CLEAN_ROOMS_API)
+        remote = post["remote_detailed_info"]
+        self.assertEqual(remote["cloud_vendor"], "azure")
+        self.assertEqual(remote["region"], "eastus")
+        self.assertEqual(remote["collaborators"][0],
+                         {"collaborator_alias": "acme", "global_metastore_id": LOCAL_GMID})
+        self.assertEqual(remote["collaborators"][1]["global_metastore_id"], PEER_GMID)
+
+    def test_owner_is_transferred_after_create(self):
+        manager(self.api).apply()
+        post = next(b for m, p, _, b in self.api.calls if m == "POST" and p == cr.CLEAN_ROOMS_API)
+        self.assertNotIn("owner", post)
+        self.assertEqual(self.api.rooms["acme_partner"]["owner"], "cr_admins")
+        patch = [b for m, p, _, b in self.api.calls if m == "PATCH" and p == f"{cr.CLEAN_ROOMS_API}/acme_partner"]
+        self.assertEqual(patch, [{"clean_room": {"owner": "cr_admins", }}])
+
+    def test_same_metastore_collaborator_needs_invite(self):
+        cfg = base_config(collaborators=[{"alias": "partner", "global_metastore_id": LOCAL_GMID}])
+        changes = manager(self.api, cfg).apply()
+        self.assertEqual([c.action for c in changes], ["WARN"])
+        self.assertIn("invite_recipient_email", changes[0].detail)
+        self.assertEqual(self.api.mutations(), [])
+        cfg = base_config(collaborators=[{"alias": "partner", "global_metastore_id": LOCAL_GMID,
+                                          "invite_recipient_email": "a@b.com",
+                                          "invite_recipient_workspace_id": 123}])
+        a = actions(manager(self.api, cfg).plan())
+        self.assertEqual(a[("CLEAN_ROOM", "acme_partner")], "CREATE")
+
+    def test_apply_then_plan_is_noop(self):
+        results = manager(self.api).apply()
+        self.assertFalse([c for c in results if c.status == "FAILED"], [c.as_row() for c in results])
+        self.assertEqual(self.api.grants["acme_partner"]["engineers"], {"MODIFY_CLEAN_ROOM"})
+        plan = manager(self.api).plan()
+        self.assertFalse(cr.has_drift(plan), cr.format_changes(plan))
+
+    def test_apply_is_idempotent(self):
+        manager(self.api).apply()
+        before = len(self.api.mutations())
+        manager(self.api).apply()
+        self.assertEqual(len(self.api.mutations()), before, "second apply must not mutate anything")
+
+    def test_deleted_room_is_treated_as_absent(self):
+        manager(self.api).apply()
+        self.api.rooms["acme_partner"]["status"] = "DELETED"
+        a = actions(manager(self.api).plan())
+        self.assertEqual(a[("CLEAN_ROOM", "acme_partner")], "CREATE")
+
+    def test_comment_and_owner_update(self):
+        manager(self.api).apply()
+        self.api.rooms["acme_partner"]["comment"] = "edited in UI"
+        a = actions(manager(self.api).plan())
+        self.assertEqual(a[("CLEAN_ROOM", "acme_partner")], "UPDATE")
+        manager(self.api).apply()
+        self.assertEqual(self.api.rooms["acme_partner"]["comment"], "managed")
+
+    def test_immutable_collaborator_change_is_drift_only(self):
+        manager(self.api).apply()
+        cfg = base_config(collaborators=[{"alias": "partner",
+                                          "global_metastore_id": "gcp:us-central1:00000000-0000-0000-0000-000000000000"}])
+        changes = manager(self.api, cfg).plan()
+        room_actions = [c.action for c in changes if c.resource_type == "CLEAN_ROOM"]
+        self.assertIn("DRIFT", room_actions)
+        self.assertNotIn("CREATE", room_actions)
+
+    def test_notebook_change_and_out_of_band_edit_detected(self):
+        manager(self.api).apply()
+        self.api.files["/Shared/nb/overlap"] = b"# Databricks notebook source\nprint(2)\n"
+        c = next(c for c in manager(self.api).plan() if c.resource == "NOTEBOOK_FILE overlap")
+        self.assertEqual((c.action, c.detail), ("UPDATE", "source notebook changed"))
+        manager(self.api).apply()
+        self.assertFalse(cr.has_drift(manager(self.api).plan()))
+        self.api.assets["acme_partner"][("NOTEBOOK_FILE", "overlap")]["notebook"]["etag"] = "etag-99"
+        c = next(c for c in manager(self.api).plan() if c.resource == "NOTEBOOK_FILE overlap")
+        self.assertIn("edited outside this tool", c.detail)
+
+    def test_unmanaged_items_drift_without_prune_and_delete_with_prune(self):
+        manager(self.api).apply()
+        self.api.assets["acme_partner"][("TABLE", "acme.cr_demo.extra")] = {
+            "asset_type": "TABLE", "name": "acme.cr_demo.extra", "owner_collaborator_alias": "acme",
+            "table_local_details": {"local_name": "main_catalog.cr_demo.extra"}}
+        self.api.assets["acme_partner"][("TABLE", "partner.p.t")] = {
+            "asset_type": "TABLE", "name": "partner.p.t", "owner_collaborator_alias": "partner"}
+        self.api.grants["acme_partner"]["stranger"] = {"MODIFY_CLEAN_ROOM"}
+        a = actions(manager(self.api).plan())
+        self.assertEqual(a[("ASSET", "TABLE acme.cr_demo.extra")], "DRIFT")
+        self.assertNotIn(("ASSET", "TABLE partner.p.t"), a)  # partner-owned assets are never touched
+        self.assertEqual(a[("GRANT", "stranger")], "DRIFT")
+        manager(self.api).apply(prune=True)
+        self.assertNotIn(("TABLE", "acme.cr_demo.extra"), self.api.assets["acme_partner"])
+        self.assertIn(("TABLE", "partner.p.t"), self.api.assets["acme_partner"])
+        self.assertEqual(self.api.grants["acme_partner"]["stranger"], set())
+
+    def test_local_name_change_needs_allow_replace(self):
+        manager(self.api).apply()
+        cfg = base_config()
+        cfg["clean_rooms"][0]["assets"][0] = {"type": "TABLE", "local_name": "main_catalog.cr_v2.members",
+                                              "name": "acme.cr_demo.members"}
+        self.assertEqual(actions(manager(self.api, cfg).plan())[("ASSET", "TABLE acme.cr_demo.members")], "DRIFT")
+        manager(self.api, cfg).apply(allow_replace=True)
+        rec = self.api.assets["acme_partner"][("TABLE", "acme.cr_demo.members")]
+        self.assertEqual(rec["table_local_details"]["local_name"], "main_catalog.cr_v2.members")
+
+    def test_partial_failure_is_reported_and_rerun_converges(self):
+        self.api.fail_on.add(("PATCH", cr.UC_PERMISSIONS_API))
+        results = manager(self.api).apply()
+        failed = [c for c in results if c.status == "FAILED"]
+        self.assertEqual({c.resource_type for c in failed}, {"GRANT"})
+        self.assertTrue(any(c.status == "APPLIED" and c.resource_type == "ASSET" for c in results))
+        self.api.fail_on.clear()
+        manager(self.api).apply()
+        self.assertFalse(cr.has_drift(manager(self.api).plan()))
+
+    def test_join_only_room_is_not_created(self):
+        cfg = base_config(create=False, collaborators=[], output_catalog=None)
+        changes = manager(self.api, cfg).apply()
+        self.assertEqual([c.action for c in changes], ["WARN"])
+        self.assertEqual(self.api.mutations(), [])
+
+    def test_destroy_requires_exact_confirmation(self):
+        manager(self.api).apply()
+        with self.assertRaises(cr.ConfigError):
+            manager(self.api).destroy(None, confirm="yes")
+        res = manager(self.api).destroy(None, confirm="acme_partner")
+        self.assertEqual(res[0].status, "APPLIED")
+        self.assertEqual(self.api.rooms["acme_partner"]["status"], "DELETED")
+        self.assertEqual(manager(self.api).destroy(None, confirm="acme_partner")[0].action, "NOOP")
+
+    def test_wait_times_out(self):
+        api = FakeApi(provision_polls=10 ** 6)
+        api.files["/Shared/nb/overlap"] = b"x"
+        m = manager(api)
+        orig = cr.time.monotonic
+        ticks = iter(range(0, 10 ** 6, 600))
+        cr.time.monotonic = lambda: next(ticks)
+        try:
+            results = m.apply()
+        finally:
+            cr.time.monotonic = orig
+        self.assertTrue(any("Timed out" in c.error for c in results))
+
+
+if __name__ == "__main__":
+    unittest.main()

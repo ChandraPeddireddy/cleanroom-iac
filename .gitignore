@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+# Environment configs (config/dev.yaml, config/prod.yaml, ...) ARE meant to be committed.
+# Only personal scratch configs are ignored.
+config/*.local.yaml
+config/*.local.json
+# Local state / logs
+state*.json
