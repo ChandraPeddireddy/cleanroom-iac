@@ -244,6 +244,30 @@ class ConfigValidationTests(unittest.TestCase):
             cloud_vendor="AZURE", region="EastUS")
         self.assertFalse(cr.has_drift(manager(api, base_config(cloud_vendor="Azure", region="eastus")).plan()))
 
+    def test_non_string_cloud_or_region_rejected(self):
+        for kw in ({"cloud_vendor": True}, {"region": 123}, {"region": ["eastus"]}):
+            with self.assertRaises(cr.ConfigError) as ctx:
+                cr.normalize_config(base_config(**kw))
+            self.assertIn("must be a string", str(ctx.exception), kw)
+
+    def test_cross_cloud_warns_but_does_not_block(self):
+        api = FakeApi()  # fake metastore cloud is azure
+        api.files["/Shared/nb/overlap"] = b"x"
+        cfg = base_config(cloud_vendor="aws", region="us-west-2")
+        plan = manager(api, cfg).plan()
+        warns = [c for c in plan if c.resource_type == "CONFIG" and c.action == "WARN"]
+        self.assertEqual(len(warns), 1)
+        self.assertIn("differs from this workspace's metastore cloud 'azure'", warns[0].detail)
+        self.assertIn(("ASSET", "CREATE"), [(c.resource_type, c.action) for c in plan])   # children still planned
+        results = manager(api, cfg).apply()
+        self.assertIn("acme_partner", api.rooms)                                     # create still happens
+        self.assertFalse([c for c in results if c.status == "FAILED"])
+
+    def test_same_cloud_has_no_warning(self):
+        api = FakeApi()
+        api.files["/Shared/nb/overlap"] = b"x"
+        self.assertFalse([c for c in manager(api).plan() if c.resource_type == "CONFIG"])
+
     def test_cloud_and_region_never_taken_from_metastore(self):
         # The fake metastore is azure/eastus2; config says aws/us-west-2. Only config may be used.
         cfg = base_config(cloud_vendor="aws", region="us-west-2")

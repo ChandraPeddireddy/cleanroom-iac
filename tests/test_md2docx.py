@@ -4,34 +4,103 @@ import sys
 import tempfile
 import unittest
 import zipfile
+import xml.dom.minidom
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 import md2docx  # noqa: E402
 
+GUIDE = os.path.join(os.path.dirname(__file__), "..", "docs", "IMPLEMENTATION_GUIDE.md")
 
-class Md2DocxTests(unittest.TestCase):
+# Child order required by ECMA-376 for the elements this converter emits (subset of the full sequence).
+RPR_ORDER = ["rStyle", "rFonts", "b", "bCs", "i", "color", "sz", "szCs"]
+PPR_ORDER = ["pStyle", "keepNext", "keepLines", "numPr", "pBdr", "shd", "spacing", "ind", "jc", "outlineLvl"]
+TBLPR_ORDER = ["tblStyle", "tblW", "jc", "tblBorders", "shd", "tblLayout", "tblCellMar", "tblLook"]
+TCPR_ORDER = ["tcW", "gridSpan", "vMerge", "tcBorders", "shd"]
+
+
+def schema_problems(xml_text):
+    """Return a list of ordering/structure violations found in a WordprocessingML part."""
+    problems = []
+    dom = xml.dom.minidom.parseString(xml_text)
+    for tag, order in (("w:rPr", RPR_ORDER), ("w:pPr", PPR_ORDER), ("w:tblPr", TBLPR_ORDER), ("w:tcPr", TCPR_ORDER)):
+        for node in dom.getElementsByTagName(tag):
+            names = [c.localName for c in node.childNodes if c.nodeType == c.ELEMENT_NODE]
+            unknown = [n for n in names if n not in order]
+            if unknown:
+                problems.append(f"{tag} has unexpected children {unknown}")
+                continue
+            if names != sorted(names, key=order.index):
+                problems.append(f"{tag} children out of order: {names}")
+            if len(names) != len(set(names)):
+                problems.append(f"{tag} has duplicate children: {names}")
+    for tbl in dom.getElementsByTagName("w:tbl"):
+        kids = [c.localName for c in tbl.childNodes if c.nodeType == c.ELEMENT_NODE]
+        if kids[:2] != ["tblPr", "tblGrid"]:
+            problems.append(f"w:tbl must start with tblPr, tblGrid; got {kids[:2]}")
+    return problems
+
+
+class SchemaTests(unittest.TestCase):
+    def test_full_guide_is_schema_ordered(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "guide.docx")
+            md2docx.build(GUIDE, out, "Title")
+            with zipfile.ZipFile(out) as z:
+                for part in ("word/document.xml", "word/styles.xml", "word/numbering.xml"):
+                    self.assertEqual(schema_problems(z.read(part).decode()), [], part)
+
+    def test_code_in_header_cell_has_single_color(self):
+        doc = f"<w:document xmlns:w='w'><w:body>{md2docx.convert('| `code` header | b |')}</w:body></w:document>"
+        self.assertEqual(schema_problems(doc), [])
+        self.assertIn(md2docx.HEADER_TEXT, doc)
+        self.assertNotIn(md2docx.CODE_COLOR, doc)
+
+
+class ConversionTests(unittest.TestCase):
     def test_dash_led_cell_is_not_a_separator(self):
-        xml = md2docx.convert("| Flag | Meaning |\n|---|:---:|\n| --mode | plan or apply |\n")
-        self.assertIn("--mode", xml)
-        self.assertEqual(xml.count("<w:tr>"), 2)          # header + data row; separator dropped
+        xml_ = md2docx.convert("| Flag | Meaning |\n|---|:---:|\n| --mode | plan or apply |\n")
+        self.assertIn("--mode", xml_)
+        self.assertEqual(xml_.count("<w:tr>"), 2)          # header + data row; separator dropped
 
     def test_separator_only_table_does_not_crash(self):
         self.assertNotIn("<w:tbl>", md2docx.convert("|---|---|\n"))
 
     def test_title_h1_removed_even_after_blank_lines(self):
-        out = os.path.join(tempfile.mkdtemp(), "x.docx")
-        with open(out + ".md", "w") as fh:
-            fh.write("\n\n# Original Title\n\nBody text\n")
-        md2docx.build(out + ".md", out, "New Title")
-        doc = zipfile.ZipFile(out).read("word/document.xml").decode()
-        self.assertIn("New Title", doc)
-        self.assertNotIn("Original Title", doc)
-        self.assertIn("Body text", doc)
+        self.assertEqual(md2docx.strip_title("\n\n# Original Title\n\nBody\n"), "\n\n\nBody\n")
 
-    def test_checkbox_and_inline_code(self):
-        xml = md2docx.convert("| T1 | `plan` | [ ] |\n")
-        self.assertIn("☐", xml)
-        self.assertIn("Consolas", xml)
+    def test_comment_in_code_fence_is_not_taken_as_title(self):
+        md = "```bash\n# install deps\n```\n# Real Title\nBody\n"
+        out = md2docx.strip_title(md)
+        self.assertIn("# install deps", out)
+        self.assertNotIn("Real Title", out)
+
+    def test_checkboxes_in_lists_tables_and_text(self):
+        self.assertIn("☐ Verify grants", md2docx.convert("- [ ] Verify grants"))
+        self.assertIn("☐", md2docx.convert("| T1 | `plan` | [ ] |"))
+        self.assertIn("☑ done", md2docx.convert("- [x] done"))
+        self.assertIn("[ ]", md2docx.convert("`[ ]` stays literal in code"))
+
+    def test_empty_edge_cells_and_unmatched_backtick(self):
+        self.assertEqual(md2docx.split_row("|a||"), ["a", ""])
+        self.assertEqual(md2docx.split_row("| a | `x|y` | b |"), [" a ", " `x|y` ", " b "])
+        self.assertEqual(md2docx.split_row("| it`s | x |"), [" it`s ", " x "])
+
+    def test_headings_five_and_six(self):
+        xml_ = md2docx.convert("##### Notes\n###### Deep")
+        self.assertNotIn("#####", xml_)
+        self.assertEqual(xml_.count('w:val="Heading4"'), 2)
+
+    def test_build_writes_title_once_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = os.path.join(d, "in.md"), os.path.join(d, "out.docx")
+            with open(src, "w") as fh:
+                fh.write("\n# Original\n\nBody text\n")
+            md2docx.build(src, out, "New Title")
+            with zipfile.ZipFile(out) as z:
+                doc = z.read("word/document.xml").decode()
+        self.assertEqual(doc.count("New Title"), 1)
+        self.assertNotIn("Original", doc)
+        self.assertIn("Body text", doc)
 
 
 if __name__ == "__main__":

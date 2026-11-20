@@ -179,7 +179,9 @@ Field rules:
 `plan` validates the config first and lists **every** problem in one error, for example a bad
 metastore ID format, unknown aliases, duplicate assets, or a missing or malformed `cloud_vendor`
 (`aws`, `azure` or `gcp`) or `region`. Both are required for rooms the tool creates. Set them once in
-`defaults` or per room; values are case-insensitive, and an empty room value falls back to `defaults`.
+`defaults` or per room; values are case-insensitive, and an empty room value falls back to `defaults`. If `cloud_vendor`
+differs from your workspace metastore's cloud, `plan` shows a `CONFIG` warning (it doesn't block); the
+API makes the final decision at apply time.
 
 ---
 
@@ -255,7 +257,7 @@ Record the result of every step. Don't onboard real rooms until T1–T12 pass.
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-Expected: `OK` (53 tests; one YAML test is skipped if PyYAML isn't installed).
+Expected: `OK` (62 tests; one YAML test is skipped if PyYAML isn't installed).
 
 ### 7.1 Live smoke test
 
@@ -376,7 +378,7 @@ Then retire this repo.
 
 | Area | Status |
 |---|---|
-| Engine logic (49 offline tests) | Tested |
+| Engine logic (52 offline tests) | Tested |
 | API paths and payloads (SDK 0.169.0 sources) | Checked against the source |
 | Plan, drift, destroy guard, state file, run log, serverless job run on Azure | Tested live (internal test workspace) |
 | Create request shape (owner, region and same-metastore rules) | Tested live, up to the authorization check |

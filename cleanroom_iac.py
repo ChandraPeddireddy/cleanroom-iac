@@ -75,15 +75,6 @@ CLOUD_VENDORS = ("aws", "azure", "gcp")
 GLOBAL_METASTORE_ID_RE = re.compile(r"^(aws|azure|gcp):[a-z0-9-]+:[0-9a-f-]{36}$")
 REGION_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")   # e.g. eastus, us-west-2, europe-west1
 
-
-def _setting(room: dict, defaults: dict, key: str) -> Optional[str]:
-    """Room value if set and non-empty, else the defaults value; trimmed and lower-cased."""
-    value = room.get(key)
-    if value is None or str(value).strip() == "":
-        value = defaults.get(key)
-    if value is None or str(value).strip() == "":
-        return None
-    return str(value).strip().lower()
 SECURABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
 THREE_PART_RE = re.compile(r"^[^.\s]+\.[^.\s]+\.[^.\s]+$")
 
@@ -91,6 +82,19 @@ THREE_PART_RE = re.compile(r"^[^.\s]+\.[^.\s]+\.[^.\s]+$")
 CREATE, UPDATE, DELETE, REPLACE = "CREATE", "UPDATE", "DELETE", "REPLACE"
 NOOP, DRIFT, WARN, WAIT = "NOOP", "DRIFT", "WARN", "WAIT"
 MUTATING_ACTIONS = {CREATE, UPDATE, DELETE, REPLACE}
+
+
+def _setting(room: dict, defaults: dict, key: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return (value, error) for a string setting: the room value if set and non-empty, else the
+    defaults value; trimmed and lower-cased. Non-string YAML values (true, 123, lists) are an error."""
+    for source in (room, defaults):
+        value = source.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        if not isinstance(value, str):
+            return None, f"'{key}' must be a string, got {type(value).__name__} {value!r}"
+        return value.strip().lower(), None
+    return None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -317,9 +321,12 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
 
         # Cloud and region of the central clean room come ONLY from config (room or defaults);
         # nothing is derived from the workspace metastore. Supported regions are decided by the API.
-        cloud_vendor = _setting(r, defaults, "cloud_vendor")
-        region = _setting(r, defaults, "region")
-        if manage_room:
+        cloud_vendor, cloud_err = _setting(r, defaults, "cloud_vendor")
+        region, region_err = _setting(r, defaults, "region")
+        for err in (cloud_err, region_err):
+            if err:
+                errors.append(f"{where}: {err}")
+        if manage_room and not (cloud_err or region_err):
             if cloud_vendor not in CLOUD_VENDORS:
                 errors.append(f"{where}: 'cloud_vendor' must be one of {list(CLOUD_VENDORS)} "
                               f"(set it on the room or in defaults; got {cloud_vendor!r})")
@@ -532,6 +539,13 @@ class CleanRoomManager:
                                   f"needs invite_recipient_email and invite_recipient_workspace_id; otherwise "
                                   f"the API rejects it as a second creator"))
                 return out
+            own_cloud = str(self.metastore.get("cloud") or "").lower()
+            if own_cloud and own_cloud != cfg["cloud_vendor"]:
+                # Informational only: config stays authoritative and the API makes the final call.
+                out.append(Change(name, "CONFIG", "cloud_vendor", WARN,
+                                  f"cloud_vendor '{cfg['cloud_vendor']}' differs from this workspace's metastore "
+                                  f"cloud '{own_cloud}'. Check this is intended; the API rejects unsupported "
+                                  f"cloud/region combinations at apply time"))
             body = self._desired_room_body(cfg)
             peers = ", ".join(f"{c['alias']}={c['global_metastore_id']}" for c in cfg["collaborators"])
             out.append(Change(name, "CLEAN_ROOM", name, CREATE,
