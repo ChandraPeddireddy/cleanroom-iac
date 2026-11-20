@@ -149,6 +149,7 @@ def base_config(**overrides):
         "comment": "managed",
         "owner": "cr_admins",
         "local_alias": "acme",
+        "cloud_vendor": "azure",
         "region": "eastus",
         "collaborators": [{"alias": "partner", "global_metastore_id": PEER_GMID}],
         "output_catalog": "acme_partner_out",
@@ -202,15 +203,57 @@ class ConfigValidationTests(unittest.TestCase):
         _, warnings = cr.normalize_config(cfg)
         self.assertEqual(len(warnings), 2)
 
-    def test_region_required_for_created_rooms(self):
+    def test_cloud_and_region_required_for_created_rooms(self):
         cfg = base_config()
         del cfg["clean_rooms"][0]["region"]
+        del cfg["clean_rooms"][0]["cloud_vendor"]
         with self.assertRaises(cr.ConfigError) as ctx:
             cr.normalize_config(cfg)
         self.assertIn("'region'", str(ctx.exception))
-        cfg["defaults"] = {"region": "westus"}
-        self.assertEqual(cr.normalize_config(cfg)[0][0]["region"], "westus")
-        cr.normalize_config(base_config(create=False, collaborators=[], region=None))
+        self.assertIn("'cloud_vendor'", str(ctx.exception))
+        cfg["defaults"] = {"cloud_vendor": "gcp", "region": "us-central1"}   # set once for all rooms
+        room = cr.normalize_config(cfg)[0][0]
+        self.assertEqual((room["cloud_vendor"], room["region"]), ("gcp", "us-central1"))
+        with self.assertRaises(cr.ConfigError):
+            cr.normalize_config(base_config(cloud_vendor="oracle"))
+        with self.assertRaises(cr.ConfigError):
+            cr.normalize_config(base_config(region="East US 2"))
+        # join-only rooms don't need either
+        cr.normalize_config(base_config(create=False, collaborators=[], region=None, cloud_vendor=None))
+
+    def test_cloud_and_region_are_normalized(self):
+        room = cr.normalize_config(base_config(cloud_vendor=" Azure ", region="EastUS"))[0][0]
+        self.assertEqual((room["cloud_vendor"], room["region"]), ("azure", "eastus"))
+        for bad in ("-", "--", "us--west", "-eastus", "east us", "east_us"):
+            with self.assertRaises(cr.ConfigError, msg=bad):
+                cr.normalize_config(base_config(region=bad))
+        for good in ("eastus", "us-west-2", "europe-west1"):
+            cr.normalize_config(base_config(region=good))
+
+    def test_empty_room_value_inherits_defaults(self):
+        cfg = base_config(cloud_vendor=None, region="")
+        cfg["defaults"] = {"cloud_vendor": "AWS", "region": "us-east-1"}
+        room = cr.normalize_config(cfg)[0][0]
+        self.assertEqual((room["cloud_vendor"], room["region"]), ("aws", "us-east-1"))
+
+    def test_live_case_difference_is_not_drift(self):
+        api = FakeApi()
+        api.files["/Shared/nb/overlap"] = b"x"
+        manager(api).apply()
+        api.rooms["acme_partner"]["remote_detailed_info"].update(
+            cloud_vendor="AZURE", region="EastUS")
+        self.assertFalse(cr.has_drift(manager(api, base_config(cloud_vendor="Azure", region="eastus")).plan()))
+
+    def test_cloud_and_region_never_taken_from_metastore(self):
+        # The fake metastore is azure/eastus2; config says aws/us-west-2. Only config may be used.
+        cfg = base_config(cloud_vendor="aws", region="us-west-2")
+        api = FakeApi()
+        api.files["/Shared/nb/overlap"] = b"x"
+        manager(api, cfg).apply()
+        post = next(b for m, p, _, b in api.calls if m == "POST" and p == cr.CLEAN_ROOMS_API)
+        self.assertEqual((post["remote_detailed_info"]["cloud_vendor"], post["remote_detailed_info"]["region"]),
+                         ("aws", "us-west-2"))
+        self.assertFalse(cr.has_drift(manager(api, cfg).plan()))
 
     def test_create_requires_a_collaborator(self):
         with self.assertRaises(cr.ConfigError):

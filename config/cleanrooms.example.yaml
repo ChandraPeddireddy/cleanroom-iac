@@ -10,6 +10,11 @@ defaults:
   # owner keeps its privileges on the source tables/volumes/views.
   owner: "<cleanroom_admins_group>"
   wait_timeout_minutes: 30
+  # Cloud and region of the CENTRAL clean room. Always taken from config, never from the
+  # workspace. Set them once here, or per room. The region must be one Clean Rooms supports
+  # for that cloud (see the Clean Rooms docs); it can differ from your metastore's region.
+  cloud_vendor: "<aws|azure|gcp>"
+  region: "<central-clean-room-region>"
 
 clean_rooms:
   # ---------------------------------------------------------------------------
@@ -18,12 +23,9 @@ clean_rooms:
   - name: acme_partner_measurement
     comment: "Acme x Partner measurement clean room (managed by cleanroom_iac; do not edit in UI)"
     local_alias: acme                 # this metastore's collaborator alias (immutable)
-    # REQUIRED: region of the central clean room. Must be a supported Clean Rooms region, which
-    # can differ from the metastore region (azure/eastus2 is rejected). Azure examples:
-    # eastus, westus, canadacentral, northeurope, westeurope. See the "Create clean rooms" docs.
-    region: eastus
-    # cloud_vendor defaults to this workspace's metastore cloud.
-    # cloud_vendor: azure
+    # cloud_vendor / region are inherited from defaults; override here for this room only:
+    # cloud_vendor: "<aws|azure|gcp>"
+    # region: "<central-clean-room-region>"
     collaborators:                      # every party except this metastore (immutable after create)
       - alias: partner
         # The collaborator's "sharing identifier" (cloud:region:metastore-uuid).

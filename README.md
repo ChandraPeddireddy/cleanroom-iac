@@ -17,8 +17,9 @@ This tool gives a Terraform-like workflow on top of the REST API: a config file 
 | `cleanroom_iac.py` | Engine (stdlib only). Plan/apply/drift/destroy, config validation, SDK and CLI transports, CLI entry point |
 | `cleanroom_iac_runner.py` | Databricks notebook that runs the engine as a job or interactively; `display()` output plus an optional Delta run log |
 | `config/cleanrooms.example.yaml` | Annotated example config |
+| `docs/CleanRooms_IaC_Implementation_Guide.docx` | Word copy of the guide. Regenerate after editing the Markdown: `python3 tools/md2docx.py docs/IMPLEMENTATION_GUIDE.md docs/CleanRooms_IaC_Implementation_Guide.docx "Clean Rooms as Code: Implementation and Test Guide"` |
 | `docs/IMPLEMENTATION_GUIDE.md` | Rollout guide: prerequisites, identity setup, jobs, test plan, CI/CD, Terraform coexistence, troubleshooting |
-| `tests/` | 45 offline tests against an in-memory fake API (`test_cleanroom_iac.py`, `test_cleanroom_iac_edges.py`) |
+| `tests/` | 53 offline tests: 49 for the engine against an in-memory fake API (`test_cleanroom_iac.py`, `test_cleanroom_iac_edges.py`) and 4 for the Word converter (`test_md2docx.py`) |
 
 ## What it manages
 
@@ -85,7 +86,7 @@ deliberately. CLI exit codes: `0` success, `1` a change failed, `2` drift found 
 ## Verification status
 
 ### Verified offline
-45 unit tests (`tests/`) run against an in-memory fake of the APIs. They cover:
+53 unit tests (`tests/`): 49 run the engine against an in-memory fake of the APIs, 4 cover the Word converter. The engine tests cover:
 - create, including the owner transfer after ACTIVE
 - idempotent re-apply (zero writes)
 - updates, and drift on immutable settings (collaborators, region, egress, shared output)
@@ -94,6 +95,7 @@ deliberately. CLI exit codes: `0` success, `1` a change failed, `2` drift found 
 - a partial failure followed by a re-run that converges
 - one failing room not blocking the others
 - join-only rooms, FAILED and PROVISIONING rooms, output catalog states, and `PERMISSION_DENIED` assets
+- config-driven cloud and region (required, case-insensitive, inherit from `defaults`, never read from the metastore)
 - pagination and URL encoding
 - both transports (CLI and SDK error mapping)
 - CLI exit codes and the destroy confirmation
@@ -110,12 +112,11 @@ deliberately. CLI exit codes: `0` success, `1` a change failed, `2` drift found 
 ### Behaviour found live and built in
 1. **The create call rejects `owner`** unless it is empty or the caller ("Clean room owner must be empty
    or match the caller"). The engine creates without an owner, then transfers ownership once the room is ACTIVE.
-2. **The central clean room region must be a supported Clean Rooms region.** `azure/eastus2` is rejected
-   ("Cloud/region azure/eastus2 is not supported"), so `region` is now required in the config. Supported Azure
-   regions per Microsoft Learn: eastus, westus, canadacentral, brazilsouth, northeurope, westeurope,
-   germanywestcentral, australiaeast, centralindia, japaneast, southeastasia. Collaborators can be in any region.
-   Source: https://learn.microsoft.com/en-us/azure/databricks/clean-rooms/create-clean-room (found via web search;
-   the region picker in the Create UI is authoritative).
+2. **Cloud and region are config-only.** The central clean room's region can differ from the workspace
+   metastore's region, and not every region supports Clean Rooms (the API answers "Cloud/region ... is not
+   supported"). So the engine never derives cloud or region from the workspace: `cloud_vendor` and
+   `region` are required in the config (per room or in `defaults`), checked for format only, and the API
+   decides whether they're supported. There is no built-in region list.
 3. **A collaborator on the same metastore needs `invite_recipient_email` + `invite_recipient_workspace_id`.**
    Without them the API rejects the request as a second creator. `plan` now reports this before calling the API.
 

@@ -48,14 +48,14 @@ Complete every item before step 4. Each has a check command (Databricks CLI, run
 | P2 | Delta Sharing enabled on the metastore | same output | `delta_sharing_scope` = `INTERNAL_AND_EXTERNAL` |
 | P3 | Serverless compute enabled in the workspace (Clean Rooms runs on serverless) | Workspace admin settings | enabled |
 | P4 | Clean Rooms available to the workspace | `databricks clean-rooms list` | returns a list (an empty `[]` is fine), not an error |
-| P5 | A **supported central clean room region** chosen | Create Clean Room UI region picker | e.g. `eastus`, `westus`, `westeurope`. **`eastus2` is not supported** for the central room, even if the metastore is in eastus2 |
+| P5 | Central clean room **cloud and region** chosen | Clean Rooms documentation for your cloud, or the region picker in the Create Clean Room UI | a region Clean Rooms supports; it can differ from your metastore's region. Set it in config (`cloud_vendor`, `region`) |
 | P6 | Partner's **sharing identifier** (their global metastore ID) | Partner copies it from Catalog Explorer > Clean Rooms | `cloud:region:metastore-uuid` |
 | P7 | Python 3.9+ and Databricks CLI on the CI runner (only if using CI or Terraform) | `databricks --version` | installed and authenticated |
 
-Supported Azure central regions (from Microsoft Learn, November 2026): eastus, westus, canadacentral,
-brazilsouth, northeurope, westeurope, germanywestcentral, australiaeast, centralindia, japaneast,
-southeastasia. Source: https://learn.microsoft.com/en-us/azure/databricks/clean-rooms/create-clean-room.
-The region picker in the UI is authoritative.
+The tool has no built-in region list. Cloud and region come only from config, and the Clean Rooms
+API decides whether a region is supported. Databricks maintains the supported regions per cloud
+(Azure: https://learn.microsoft.com/en-us/azure/databricks/clean-rooms/create-clean-room). If a
+region isn't supported, `apply` reports the API error and creates nothing.
 
 > **Important (seen in testing):** a user can hold `CREATE_CLEAN_ROOM` and still get
 > "User is not authorized to create a clean room" if Clean Rooms is not enabled for the
@@ -138,12 +138,13 @@ version: 1
 defaults:
   owner: "grp-cleanroom-owners-dev"
   wait_timeout_minutes: 30
+  cloud_vendor: "<aws|azure|gcp>"           # central clean room cloud (config only)
+  region: "<central-clean-room-region>"     # central clean room region (config only)
 
 clean_rooms:
   - name: acme_partner_measurement          # letters, digits, _ and -
     comment: "Managed by cleanroom_iac - do not edit in UI"
     local_alias: acme                       # your alias inside the room (immutable)
-    region: eastus                          # supported CENTRAL region (not eastus2)
     collaborators:
       - alias: partner
         global_metastore_id: "azure:<region>:<partner-metastore-uuid>"   # partner sharing identifier
@@ -168,7 +169,7 @@ Field rules:
 
 | Field | Mutable after create? | Notes |
 |---|---|---|
-| `name`, `local_alias`, `region`, `collaborators`, `egress_network_policy` | **No** | A change shows as `DRIFT`. It needs a new room (new name) |
+| `name`, `local_alias`, `cloud_vendor`, `region`, `collaborators`, `egress_network_policy` | **No** | A change shows as `DRIFT`. It needs a new room (new name) |
 | `comment`, `owner` | Yes | Updated by `apply` |
 | `assets`, `auto_approval_rules`, `grants` | Yes | Created, updated, or deleted (with `prune`) by `apply` |
 | `output_catalog` | Create once | Name can't change after creation |
@@ -176,7 +177,9 @@ Field rules:
 | collaborator on the **same** metastore | n/a | Must also set `invite_recipient_email` and `invite_recipient_workspace_id` |
 
 `plan` validates the config first and lists **every** problem in one error, for example a bad
-metastore ID format, unknown aliases, duplicate assets or a missing region.
+metastore ID format, unknown aliases, duplicate assets, or a missing or malformed `cloud_vendor`
+(`aws`, `azure` or `gcp`) or `region`. Both are required for rooms the tool creates. Set them once in
+`defaults` or per room; values are case-insensitive, and an empty room value falls back to `defaults`.
 
 ---
 
@@ -252,7 +255,7 @@ Record the result of every step. Don't onboard real rooms until T1–T12 pass.
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-Expected: `OK` (45 tests; one YAML test is skipped if PyYAML isn't installed).
+Expected: `OK` (53 tests; one YAML test is skipped if PyYAML isn't installed).
 
 ### 7.1 Live smoke test
 
@@ -347,7 +350,7 @@ Then retire this repo.
 | Message / symptom | Cause | Fix |
 |---|---|---|
 | `Clean room owner must be empty or match the caller` | Owner sent on create | Already handled (create, then transfer). If you see it, you're on an old copy of the code |
-| `Cloud/region azure/eastus2 is not supported` | Central region not supported | Set `region` to a supported region (section 2) |
+| `Cloud/region <cloud>/<region> is not supported` | That central region isn't supported for Clean Rooms | Change `region` (or `cloud_vendor`) in the config to a supported value (section 2) |
 | `Request collaborators should include the creator at most one time` | Collaborator uses your own metastore ID without an invite | Add `invite_recipient_email` + `invite_recipient_workspace_id`, or use the partner's ID |
 | `User is not authorized to create a clean room` | Missing `CREATE CLEAN ROOM`, or Clean Rooms not enabled for the workspace/account | Check section 3.2; if granted, escalate to the account team |
 | Asset `WARN PERMISSION_DENIED` | Owner group lost access to the source object | Restore the grants from section 3.2 |
@@ -373,7 +376,7 @@ Then retire this repo.
 
 | Area | Status |
 |---|---|
-| Engine logic (45 offline tests) | Tested |
+| Engine logic (49 offline tests) | Tested |
 | API paths and payloads (SDK 0.169.0 sources) | Checked against the source |
 | Plan, drift, destroy guard, state file, run log, serverless job run on Azure | Tested live (internal test workspace) |
 | Create request shape (owner, region and same-metastore rules) | Tested live, up to the authorization check |

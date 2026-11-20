@@ -71,7 +71,19 @@ SUPPORTED_ASSET_TYPES = set(LOCAL_DETAILS_FIELD) | {NOTEBOOK}
 # with a warning so the API, not this tool, is the final authority.
 KNOWN_CLEAN_ROOM_PRIVILEGES = {"MODIFY_CLEAN_ROOM", "EXECUTE_CLEAN_ROOM_TASK"}
 
+CLOUD_VENDORS = ("aws", "azure", "gcp")
 GLOBAL_METASTORE_ID_RE = re.compile(r"^(aws|azure|gcp):[a-z0-9-]+:[0-9a-f-]{36}$")
+REGION_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")   # e.g. eastus, us-west-2, europe-west1
+
+
+def _setting(room: dict, defaults: dict, key: str) -> Optional[str]:
+    """Room value if set and non-empty, else the defaults value; trimmed and lower-cased."""
+    value = room.get(key)
+    if value is None or str(value).strip() == "":
+        value = defaults.get(key)
+    if value is None or str(value).strip() == "":
+        return None
+    return str(value).strip().lower()
 SECURABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
 THREE_PART_RE = re.compile(r"^[^.\s]+\.[^.\s]+\.[^.\s]+$")
 
@@ -303,11 +315,18 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
             warnings.append(f"{where}: owner '{owner}' is a user. Databricks recommends a group as clean "
                             f"room owner, because asset access depends on the owner's privileges")
 
-        region = r.get("region", defaults.get("region"))
-        if manage_room and not region:
-            errors.append(f"{where}: 'region' (central clean room region) is required. It must be a region "
-                          f"Clean Rooms supports (Azure e.g. eastus, westus, westeurope); the metastore's own "
-                          f"region may not be supported (azure/eastus2 is rejected)")
+        # Cloud and region of the central clean room come ONLY from config (room or defaults);
+        # nothing is derived from the workspace metastore. Supported regions are decided by the API.
+        cloud_vendor = _setting(r, defaults, "cloud_vendor")
+        region = _setting(r, defaults, "region")
+        if manage_room:
+            if cloud_vendor not in CLOUD_VENDORS:
+                errors.append(f"{where}: 'cloud_vendor' must be one of {list(CLOUD_VENDORS)} "
+                              f"(set it on the room or in defaults; got {cloud_vendor!r})")
+            if not region or not REGION_RE.match(region):
+                errors.append(f"{where}: 'region' of the central clean room is required (set it on the room "
+                              f"or in defaults). Use a region Clean Rooms supports for that cloud; it can "
+                              f"differ from your metastore's region (got {region!r})")
 
         egress = r.get("egress_network_policy")
         rooms.append({
@@ -316,7 +335,7 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
             "comment": r.get("comment"),
             "owner": owner,
             "local_alias": local_alias,
-            "cloud_vendor": r.get("cloud_vendor", defaults.get("cloud_vendor")),
+            "cloud_vendor": cloud_vendor,
             "region": region,
             "collaborators": collabs,
             "enable_shared_output": r.get("enable_shared_output"),
@@ -480,8 +499,8 @@ class CleanRoomManager:
                 entry["invite_recipient_workspace_id"] = c["invite_recipient_workspace_id"]
             collaborators.append(entry)
         remote = {
-            "cloud_vendor": cfg.get("cloud_vendor") or ms.get("cloud"),
-            "region": cfg.get("region") or ms.get("region"),
+            "cloud_vendor": cfg["cloud_vendor"],
+            "region": cfg["region"],
             "collaborators": collaborators,
         }
         if cfg.get("egress_network_policy"):
@@ -540,11 +559,13 @@ class CleanRoomManager:
         # Immutable, creator-owned settings: report only. Changing them needs a new room.
         if cfg["create"]:
             immut = []
-            want_cloud = cfg.get("cloud_vendor") or self.metastore.get("cloud")
-            want_region = cfg.get("region") or self.metastore.get("region")
-            if remote.get("cloud_vendor") and remote.get("cloud_vendor") != want_cloud:
+            want_cloud = cfg["cloud_vendor"]
+            want_region = cfg["region"]
+            live_cloud = str(remote.get("cloud_vendor") or "").lower()
+            live_region = str(remote.get("region") or "").lower()
+            if live_cloud and live_cloud != want_cloud:
                 immut.append(f"cloud_vendor {remote.get('cloud_vendor')} -> {want_cloud}")
-            if remote.get("region") and remote.get("region") != want_region:
+            if live_region and live_region != want_region:
                 immut.append(f"region {remote.get('region')} -> {want_region}")
             live_peers = {c.get("collaborator_alias"): c.get("global_metastore_id")
                           for c in remote.get("collaborators") or []
