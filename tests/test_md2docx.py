@@ -80,6 +80,30 @@ class ConversionTests(unittest.TestCase):
         self.assertIn("☑ done", md2docx.convert("- [x] done"))
         self.assertIn("[ ]", md2docx.convert("`[ ]` stays literal in code"))
 
+    def test_brackets_in_prose_are_left_alone(self):
+        for text in ("matrix[x] and opt[X]", "use [ ] for empty", "**opt[X]** bold", "see [x] below"):
+            xml_ = md2docx.convert(text)
+            self.assertNotIn("\u2610", xml_, text)
+            self.assertNotIn("\u2611", xml_, text)
+        cell = md2docx.convert("| H1 | H2 |\n|---|---|\n| a [ ] b | [x] |")
+        self.assertIn("a [ ] b", cell)                    # partial cell text untouched
+        self.assertIn("\u2611", cell)                      # whole-cell [x] converted
+        self.assertIn("\u2610 step", md2docx.convert("1. [ ] step"))
+        self.assertIn("[x]y", md2docx.convert("- [x]y no space"))   # needs '[x] ' prefix
+
+    def test_indented_title_is_removed(self):
+        out = md2docx.strip_title("  # Indented Title\nBody\n")
+        self.assertNotIn("Indented Title", out)
+        self.assertIn("Body", out)
+
+    def test_unmatched_backtick_row_fits_header(self):
+        xml_ = md2docx.convert("| A | B |\n|---|---|\n| it`s | a|b |\n| ok | ok |")
+        self.assertEqual(xml_.count("<w:gridCol "), 2)     # still 2 columns
+        self.assertEqual(xml_.count("<w:tc>"), 6)           # 3 rows x 2 cells
+        self.assertIn(">a|b</w:t>", xml_)                  # extra cell merged back (cell text is trimmed)
+        self.assertEqual(md2docx.fit_to_header([["h1", "h2"], ["a", "b", "c", "d"], ["x"]]),
+                         [["h1", "h2"], ["a", "b|c|d"], ["x"]])
+
     def test_empty_edge_cells_and_unmatched_backtick(self):
         self.assertEqual(md2docx.split_row("|a||"), ["a", ""])
         self.assertEqual(md2docx.split_row("| a | `x|y` | b |"), [" a ", " `x|y` ", " b "])

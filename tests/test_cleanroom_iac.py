@@ -250,6 +250,54 @@ class ConfigValidationTests(unittest.TestCase):
                 cr.normalize_config(base_config(**kw))
             self.assertIn("must be a string", str(ctx.exception), kw)
 
+    def test_join_only_rooms_ignore_cloud_and_region_types(self):
+        cfg = base_config(create=False, collaborators=[], cloud_vendor=True, region=123)
+        cfg["defaults"] = {"region": False}          # bad default used by nobody
+        room = cr.normalize_config(cfg)[0][0]
+        self.assertEqual((room["cloud_vendor"], room["region"]), (None, None))
+        # a valid value on a join-only room is still kept (normalized), as before
+        room = cr.normalize_config(base_config(create=False, collaborators=[], region="EastUS"))[0][0]
+        self.assertEqual(room["region"], "eastus")
+
+    def test_bad_default_reported_once_and_only_when_used(self):
+        cfg = base_config(cloud_vendor=None, region=None)
+        for n in range(1, 6):                          # 6 created rooms inherit the bad default
+            extra = json.loads(json.dumps(cfg["clean_rooms"][0]))
+            extra["name"] = f"room_{n}"
+            cfg["clean_rooms"].append(extra)
+        cfg["defaults"] = {"cloud_vendor": "azure", "region": 123}
+        with self.assertRaises(cr.ConfigError) as ctx:
+            cr.normalize_config(cfg)
+        msg = str(ctx.exception)
+        self.assertEqual(msg.count("must be a string"), 1, msg)
+        self.assertIn("defaults: 'region' must be a string, got int 123", msg)
+        self.assertNotIn("'region' of the central clean room is required", msg)   # no follow-on noise
+        # every created room overrides the bad default -> no error at all
+        for r in cfg["clean_rooms"]:
+            r["region"] = "eastus"
+        cr.normalize_config(cfg)
+
+    def test_room_level_bad_value_names_the_room(self):
+        with self.assertRaises(cr.ConfigError) as ctx:
+            cr.normalize_config(base_config(region=["eastus"]))
+        self.assertIn("clean room 'acme_partner': 'region' must be a string, got list", str(ctx.exception))
+
+    def test_blocking_is_an_explicit_flag(self):
+        api = FakeApi()
+        api.files["/Shared/nb/overlap"] = b"x"
+        same_ms = base_config(collaborators=[{"alias": "partner", "global_metastore_id": LOCAL_GMID}])
+        self.assertTrue(all(c.blocking for c in manager(api, same_ms).plan()))
+        join = base_config(create=False, collaborators=[], output_catalog=None)
+        self.assertTrue(all(c.blocking for c in manager(api, join).plan()))
+        manager(api).apply()
+        api.rooms["acme_partner"]["status"] = "FAILED"
+        self.assertEqual([(c.action, c.blocking) for c in manager(api).plan()], [("WARN", True)])
+        # non-blocking warnings, whatever their label, never stop child planning
+        cross = [c for c in manager(FakeApi(), base_config(cloud_vendor="aws", region="us-west-2")).plan()
+                 if c.action == "WARN"]
+        self.assertTrue(cross and not any(c.blocking for c in cross))
+        self.assertNotIn("blocking", cross[0].as_row())          # output schema unchanged
+
     def test_cross_cloud_warns_but_does_not_block(self):
         api = FakeApi()  # fake metastore cloud is azure
         api.files["/Shared/nb/overlap"] = b"x"

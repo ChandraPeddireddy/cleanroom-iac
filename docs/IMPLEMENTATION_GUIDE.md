@@ -257,7 +257,7 @@ Record the result of every step. Don't onboard real rooms until T1–T12 pass.
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-Expected: `OK` (62 tests; one YAML test is skipped if PyYAML isn't installed).
+Expected: `OK` (69 tests; one YAML test is skipped if PyYAML isn't installed).
 
 ### 7.1 Live smoke test
 
@@ -378,7 +378,7 @@ Then retire this repo.
 
 | Area | Status |
 |---|---|
-| Engine logic (52 offline tests) | Tested |
+| Engine logic (56 offline tests) | Tested |
 | API paths and payloads (SDK 0.169.0 sources) | Checked against the source |
 | Plan, drift, destroy guard, state file, run log, serverless job run on Azure | Tested live (internal test workspace) |
 | Create request shape (owner, region and same-metastore rules) | Tested live, up to the authorization check |

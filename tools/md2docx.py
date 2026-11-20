@@ -3,11 +3,12 @@
     python3 tools/md2docx.py docs/IMPLEMENTATION_GUIDE.md docs/CleanRooms_IaC_Implementation_Guide.docx \
         "Clean Rooms as Code: Implementation and Test Guide"
 
-Supports: # to ###### headings, paragraphs, - / 1. lists, [ ] checkboxes (in lists, tables or text),
+Supports: # to ###### headings, paragraphs, - / 1. lists, [ ] / [x] checkboxes (list-item prefix or a
+whole table cell; brackets elsewhere are left as text),
 pipe tables, ``` code blocks, > quotes, ---, **bold**, `code`, [text](url). The first H1 outside a code
 block is replaced by the given title.
 Not supported: escaped pipes (\\|) inside table cells, and code or links nested inside **bold**. A table row
-with an unmatched backtick is split on every pipe.
+with an unmatched backtick is split on every pipe and then fitted to the header's column count.
 
 Elements are written in the order the WordprocessingML schema (ECMA-376) requires, e.g. run properties
 rFonts, b, color, sz and paragraph properties pStyle, numPr, pBdr, shd, spacing, ind; tables have tblGrid.
@@ -23,6 +24,8 @@ CODE_COLOR = "9C2B0E"
 HEADER_FILL = "1F3864"
 HEADER_TEXT = "FFFFFF"
 TEXT_WIDTH_TWIPS = 12240 - 2 * 1080          # US Letter minus left/right margins
+CHECKBOXES = {"[ ]": "\u2610", "[x]": "\u2611", "[X]": "\u2611"}
+LIST_CHECKBOX = re.compile(r"^\[([ xX])\] ")
 LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 INLINE = re.compile(r"(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))")
 SEPARATOR_CELL = re.compile(r"^\s*:?-{3,}:?\s*$")
@@ -74,10 +77,19 @@ def runs(text, bold=False, size=None, color=None):
         elif LINK.fullmatch(part):
             m = LINK.fullmatch(part)
             t = m.group(1) if m.group(1) == m.group(2) else f"{m.group(1)} ({m.group(2)})"
-        if not mono:
-            t = t.replace("[ ]", "☐").replace("[x]", "☑").replace("[X]", "☑")
         out.append(f'<w:r>{rpr(b, mono, color, size)}<w:t xml:space="preserve">{escape(t)}</w:t></w:r>')
     return "".join(out)
+
+
+def checkbox_cell(text):
+    """A table cell that is exactly [ ] / [x] becomes a checkbox glyph; other text is left alone."""
+    return CHECKBOXES.get(text.strip(), text)
+
+
+def checkbox_item(text):
+    """A list item starting with '[ ] ' / '[x] ' gets a checkbox glyph instead of the brackets."""
+    m = LIST_CHECKBOX.match(text)
+    return CHECKBOXES[f"[{m.group(1)}]"] + text[3:] if m else text
 
 
 def para(text, **kw):
@@ -113,7 +125,7 @@ def table(rows):
             shd = f'<w:shd w:val="clear" w:color="auto" w:fill="{HEADER_FILL}"/>' if header else ""
             xml.append(f'<w:tc><w:tcPr><w:tcW w:w="{col_w}" w:type="dxa"/>{shd}</w:tcPr>'
                        f'<w:p>{ppr(spacing=(20, 20))}'
-                       f'{runs(c.strip(), bold=header, size=18, color=HEADER_TEXT if header else None)}</w:p></w:tc>')
+                       f'{runs(checkbox_cell(c.strip()), bold=header, size=18, color=HEADER_TEXT if header else None)}</w:p></w:tc>')
         xml.append("</w:tr>")
     return "".join(xml) + "</w:tbl>" + spacer()
 
@@ -138,6 +150,13 @@ def split_row(line):
     return cells
 
 
+def fit_to_header(rows):
+    """Keep every row at the header's width: extra cells (e.g. from an unmatched backtick) are joined
+    back into the last cell with '|', so one odd row can't add a column to the whole table."""
+    width = len(rows[0])
+    return [r if len(r) <= width else r[:width - 1] + ["|".join(r[width - 1:])] for r in rows]
+
+
 def is_separator(cells):
     """A separator row has only dash cells (|---|:---:|); a data cell like `--mode` is not one."""
     return bool(cells) and all(SEPARATOR_CELL.match(c) for c in cells)
@@ -149,7 +168,7 @@ def strip_title(md):
     for i, ln in enumerate(lines):
         if ln.strip().startswith("```"):
             in_fence = not in_fence
-        elif not in_fence and re.match(r"^# ", ln):
+        elif not in_fence and re.match(r"^# ", ln.strip()):
             return "".join(lines[:i] + lines[i + 1:])
     return md
 
@@ -172,7 +191,7 @@ def convert(md):
                     rows.append(cells)
                 i += 1
             if rows:
-                body.append(table(rows))
+                body.append(table(fit_to_header(rows)))
             continue
         elif re.match(r"^#{1,6} ", s):
             level = len(s.split(" ")[0])
@@ -182,9 +201,9 @@ def convert(md):
         elif s.startswith(">"):
             body.append(para(s.lstrip(">").strip(), shade="FFF4CE", indent=200))
         elif re.match(r"^[-*] ", s):
-            body.append(para(s[2:], num=1))
+            body.append(para(checkbox_item(s[2:]), num=1))
         elif re.match(r"^\d+\. ", s):
-            body.append(para(re.sub(r"^\d+\. ", "", s), num=2))
+            body.append(para(checkbox_item(re.sub(r"^\d+\. ", "", s)), num=2))
         elif s:
             body.append(para(s))
         i += 1

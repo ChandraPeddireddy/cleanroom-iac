@@ -84,17 +84,25 @@ NOOP, DRIFT, WARN, WAIT = "NOOP", "DRIFT", "WARN", "WAIT"
 MUTATING_ACTIONS = {CREATE, UPDATE, DELETE, REPLACE}
 
 
-def _setting(room: dict, defaults: dict, key: str) -> Tuple[Optional[str], Optional[str]]:
-    """Return (value, error) for a string setting: the room value if set and non-empty, else the
-    defaults value; trimmed and lower-cased. Non-string YAML values (true, 123, lists) are an error."""
-    for source in (room, defaults):
-        value = source.get(key)
-        if value is None or (isinstance(value, str) and not value.strip()):
-            continue
-        if not isinstance(value, str):
-            return None, f"'{key}' must be a string, got {type(value).__name__} {value!r}"
-        return value.strip().lower(), None
-    return None, None
+def _clean_setting(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Normalize one string setting. Returns (value, error): empty -> (None, None); non-string YAML
+    values such as true, 123 or lists -> (None, error); otherwise the trimmed, lower-cased string."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, None
+    if not isinstance(value, str):
+        return None, f"must be a string, got {type(value).__name__} {value!r}"
+    return value.strip().lower(), None
+
+
+def _setting(room: dict, clean_defaults: Dict[str, Optional[str]], key: str) -> Tuple[Optional[str], Optional[str]]:
+    """Room value if set and non-empty, else the (already validated) defaults value.
+    Returns (value, error); the error concerns the room's own value only."""
+    value, err = _clean_setting(room.get(key))
+    if err:
+        return None, f"'{key}' {err}"
+    if value is not None:
+        return value, None
+    return clean_defaults.get(key), None
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +194,16 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
     rooms_raw = raw.get("clean_rooms") or []
     if not isinstance(rooms_raw, list) or not rooms_raw:
         raise ConfigError("Config must contain a non-empty 'clean_rooms' list")
+
+    # cloud_vendor / region defaults are validated once. A bad default is reported once, and only if a
+    # room the tool creates actually inherits it (join-only rooms never use these settings).
+    clean_defaults: Dict[str, Optional[str]] = {}
+    bad_defaults: Dict[str, str] = {}
+    used_bad_defaults = set()
+    for key in ("cloud_vendor", "region"):
+        clean_defaults[key], err = _clean_setting(defaults.get(key))
+        if err:
+            bad_defaults[key] = f"defaults: '{key}' {err}"
 
     seen_rooms = set()
     rooms: List[dict] = []
@@ -321,16 +339,21 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
 
         # Cloud and region of the central clean room come ONLY from config (room or defaults);
         # nothing is derived from the workspace metastore. Supported regions are decided by the API.
-        cloud_vendor, cloud_err = _setting(r, defaults, "cloud_vendor")
-        region, region_err = _setting(r, defaults, "region")
-        for err in (cloud_err, region_err):
-            if err:
-                errors.append(f"{where}: {err}")
-        if manage_room and not (cloud_err or region_err):
-            if cloud_vendor not in CLOUD_VENDORS:
+        cloud_vendor, cloud_err = _setting(r, clean_defaults, "cloud_vendor")
+        region, region_err = _setting(r, clean_defaults, "region")
+        if manage_room:  # join-only rooms ignore cloud_vendor / region entirely
+            skip = set()
+            for key, value, err in (("cloud_vendor", cloud_vendor, cloud_err), ("region", region, region_err)):
+                if err:
+                    errors.append(f"{where}: {err}")
+                    skip.add(key)
+                elif value is None and key in bad_defaults:
+                    used_bad_defaults.add(key)  # reported once after the loop
+                    skip.add(key)
+            if "cloud_vendor" not in skip and cloud_vendor not in CLOUD_VENDORS:
                 errors.append(f"{where}: 'cloud_vendor' must be one of {list(CLOUD_VENDORS)} "
                               f"(set it on the room or in defaults; got {cloud_vendor!r})")
-            if not region or not REGION_RE.match(region):
+            if "region" not in skip and (not region or not REGION_RE.match(region)):
                 errors.append(f"{where}: 'region' of the central clean room is required (set it on the room "
                               f"or in defaults). Use a region Clean Rooms supports for that cloud; it can "
                               f"differ from your metastore's region (got {region!r})")
@@ -354,6 +377,7 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
             "wait_timeout_minutes": int(r.get("wait_timeout_minutes", defaults.get("wait_timeout_minutes", 30))),
         })
 
+    errors = [bad_defaults[k] for k in sorted(used_bad_defaults)] + errors
     if errors:
         raise ConfigError("Invalid clean room config:\n  - " + "\n  - ".join(errors))
     return rooms, warnings
@@ -422,11 +446,13 @@ class Change:
     detail: str = ""
     status: str = "PLANNED"     # PLANNED | APPLIED | FAILED | SKIPPED
     error: str = ""
+    blocking: bool = False      # True: the room's assets, rules and grants are not planned/applied
     _fn: Optional[Callable[[], None]] = field(default=None, repr=False, compare=False)
 
     def as_row(self) -> dict:
         d = asdict(self)
         d.pop("_fn", None)
+        d.pop("blocking", None)  # internal flag; keeps the output/run-log schema unchanged
         return d
 
 
@@ -528,7 +554,8 @@ class CleanRoomManager:
             if not cfg["create"]:
                 out.append(Change(name, "CLEAN_ROOM", name, WARN,
                                   "create: false and the room is not visible in this metastore yet. "
-                                  "It appears after the creator adds this metastore as a collaborator."))
+                                  "It appears after the creator adds this metastore as a collaborator.",
+                                  blocking=True))
                 return out
             own_gmid = self.metastore.get("global_metastore_id")
             same = [c["alias"] for c in cfg["collaborators"]
@@ -537,7 +564,7 @@ class CleanRoomManager:
                 out.append(Change(name, "CLEAN_ROOM", name, WARN,
                                   f"Collaborator(s) {same} use this metastore's ID. A same-metastore collaborator "
                                   f"needs invite_recipient_email and invite_recipient_workspace_id; otherwise "
-                                  f"the API rejects it as a second creator"))
+                                  f"the API rejects it as a second creator", blocking=True))
                 return out
             own_cloud = str(self.metastore.get("cloud") or "").lower()
             if own_cloud and own_cloud != cfg["cloud_vendor"]:
@@ -558,7 +585,8 @@ class CleanRoomManager:
         status = live.get("status")
         if status == "FAILED":
             out.append(Change(name, "CLEAN_ROOM", name, WARN,
-                              "Room is FAILED. Delete it (destroy mode) and re-apply; not auto-recreated."))
+                              "Room is FAILED. Delete it (destroy mode) and re-apply; not auto-recreated.",
+                              blocking=True))
             return out
         if status == "PROVISIONING":
             out.append(Change(name, "CLEAN_ROOM", name, WAIT, "Room is PROVISIONING"))
@@ -865,7 +893,7 @@ class CleanRoomManager:
                 changes += room_changes
                 if live is None and not cfg["create"]:
                     continue
-                if any(c.action == WARN and c.resource_type == "CLEAN_ROOM" for c in room_changes):
+                if any(c.blocking for c in room_changes):
                     continue
                 changes += self._plan_children(cfg, live if live and live.get("status") == "ACTIVE" else None,
                                                prune, allow_replace)
@@ -889,7 +917,7 @@ class CleanRoomManager:
                     continue
                 if live is None and not cfg["create"]:
                     continue
-                if any(c.action == WARN and c.resource_type == "CLEAN_ROOM" for c in room_changes):
+                if any(c.blocking for c in room_changes):
                     continue
                 if live is None or live.get("status") != "ACTIVE":
                     live = self._wait_active(name, cfg["wait_timeout_minutes"])
