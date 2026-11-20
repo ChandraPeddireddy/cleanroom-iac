@@ -286,6 +286,32 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn("'region' must be a string", joined)
         self.assertIn("ignored because create: false", joined)
 
+    def test_join_only_misspelled_values_warn(self):
+        cfg = base_config(create=False, collaborators=[], cloud_vendor="azrue", region="East US")
+        rooms, warnings = cr.normalize_config(cfg)
+        joined = " ".join(warnings)
+        self.assertIn("'cloud_vendor' must be one of", joined)
+        self.assertIn("'region' is not a valid region identifier", joined)
+        self.assertEqual(joined.count("ignored because create: false"), 2)
+        _, warnings = cr.normalize_config(base_config(create=False, collaborators=[], region="eastus"))
+        self.assertFalse([w for w in warnings if "region" in w])          # valid value: no warning
+
+    def test_bad_default_only_used_by_join_only_rooms_warns_once(self):
+        cfg = base_config(create=False, collaborators=[], cloud_vendor=None, region=None)
+        second = json.loads(json.dumps(cfg["clean_rooms"][0]))
+        second["name"] = "joined_2"
+        cfg["clean_rooms"].append(second)
+        cfg["defaults"] = {"cloud_vendor": "azrue"}
+        _, warnings = cr.normalize_config(cfg)                              # no error
+        hits = [w for w in warnings if "defaults: 'cloud_vendor' must be one of" in w]
+        self.assertEqual(len(hits), 1, warnings)
+        self.assertIn("only inherited by create: false rooms", hits[0])
+        # once a created room inherits it, it is an error (reported once) and not also a warning
+        cfg["clean_rooms"].append(base_config(cloud_vendor=None)["clean_rooms"][0])
+        with self.assertRaises(cr.ConfigError) as ctx:
+            cr.normalize_config(cfg)
+        self.assertEqual(str(ctx.exception).count("defaults: 'cloud_vendor'"), 1)
+
     def test_misspelled_default_reported_once(self):
         cfg = base_config(cloud_vendor=None, region=None)
         for n in range(1, 6):

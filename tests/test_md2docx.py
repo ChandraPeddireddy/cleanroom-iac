@@ -119,6 +119,12 @@ class ConversionTests(unittest.TestCase):
         self.assertNotIn("Heading", md2docx.convert("    # install deps"))
         self.assertIn('w:val="Heading1"', md2docx.convert("   # three spaces is still a heading"))
 
+    def test_empty_heading_is_not_a_heading(self):
+        for md in ("# ", "#", "##   ", "   #  "):
+            self.assertNotIn("Heading", md2docx.convert(md), repr(md))
+        self.assertIn('w:val="Heading1"', md2docx.convert("#  Two spaces before text"))
+        self.assertEqual(md2docx.strip_title("# \n# Real\n"), "# \n")
+
     def test_indented_title_is_removed(self):
         out = md2docx.strip_title("  # Indented Title\nBody\n")
         self.assertNotIn("Indented Title", out)

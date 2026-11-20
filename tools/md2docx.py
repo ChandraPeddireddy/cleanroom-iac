@@ -28,7 +28,7 @@ HEADER_TEXT = "FFFFFF"
 TEXT_WIDTH_TWIPS = 12240 - 2 * 1080          # US Letter minus left/right margins
 CHECKBOXES = {"[ ]": "\u2610", "[x]": "\u2611", "[X]": "\u2611"}
 LEADING_CHECKBOX = re.compile(r"^\[([ xX])\](?=\s|$)")   # "[ ] task", "[x]" -- not "[x](url)" or "[x]y"
-HEADING = re.compile(r"^ {0,3}(#{1,6}) (.*)$")               # CommonMark: at most 3 leading spaces
+HEADING = re.compile(r"^ {0,3}(#{1,6}) +(\S.*)$")           # CommonMark: <= 3 leading spaces, non-empty text
 LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 INLINE = re.compile(r"(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))")
 SEPARATOR_CELL = re.compile(r"^\s*:?-{3,}:?\s*$")
@@ -155,8 +155,9 @@ def _split_row(line):
 
 
 def fit_to_header(rows):
-    """Keep every row at the header's width: extra cells (e.g. from an unmatched backtick) are joined
-    back into the last cell with '|', so one odd row can't add a column to the whole table."""
+    """Cap every row after the header at the header's width by joining extra cells into the last cell
+    with '|'. convert() applies it only to rows split by the unmatched-backtick fallback; genuinely
+    wider rows are left alone and widen the table."""
     width = len(rows[0])
     return [r if len(r) <= width else r[:width - 1] + ["|".join(r[width - 1:])] for r in rows]
 

@@ -94,6 +94,15 @@ def _clean_setting(value: Any) -> Tuple[Optional[str], Optional[str]]:
     return value.strip().lower(), None
 
 
+def _value_error(key: str, value: str) -> Optional[str]:
+    """Format check for a normalized cloud_vendor / region value (support is decided by the API)."""
+    if key == "cloud_vendor" and value not in CLOUD_VENDORS:
+        return f"must be one of {list(CLOUD_VENDORS)} (got {value!r})"
+    if key == "region" and not REGION_RE.match(value):
+        return f"is not a valid region identifier (got {value!r})"
+    return None
+
+
 def _setting(room: dict, clean_defaults: Dict[str, Optional[str]], key: str) -> Tuple[Optional[str], Optional[str]]:
     """Room value if set and non-empty, else the (already validated) defaults value.
     Returns (value, error); the error concerns the room's own value only."""
@@ -200,13 +209,11 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
     clean_defaults: Dict[str, Optional[str]] = {}
     bad_defaults: Dict[str, str] = {}
     used_bad_defaults = set()
+    joined_bad_defaults = set()  # bad defaults inherited only by join-only rooms -> warning, not error
     for key in ("cloud_vendor", "region"):
         value, err = _clean_setting(defaults.get(key))
         if not err and value is not None:
-            if key == "cloud_vendor" and value not in CLOUD_VENDORS:
-                err = f"must be one of {list(CLOUD_VENDORS)} (got {value!r})"
-            elif key == "region" and not REGION_RE.match(value):
-                err = f"is not a valid region identifier (got {value!r})"
+            err = _value_error(key, value)
         clean_defaults[key] = None if err else value
         if err:
             bad_defaults[key] = f"defaults: '{key}' {err}"
@@ -349,9 +356,15 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
         region, region_err = _setting(r, clean_defaults, "region")
         if not manage_room:
             # Not used for join-only rooms, but surface typos before the room is ever switched to create: true.
-            for err in (cloud_err, region_err):
+            for key, value, err in (("cloud_vendor", cloud_vendor, cloud_err), ("region", region, region_err)):
+                own_value = _clean_setting(r.get(key))[0]
                 if err:
                     warnings.append(f"{where}: {err} (ignored because create: false)")
+                elif own_value is not None and _value_error(key, own_value):
+                    warnings.append(f"{where}: '{key}' {_value_error(key, own_value)} "
+                                    f"(ignored because create: false)")
+                elif own_value is None and key in bad_defaults:
+                    joined_bad_defaults.add(key)
         if manage_room:
             skip = set()
             for key, value, err in (("cloud_vendor", cloud_vendor, cloud_err), ("region", region, region_err)):
@@ -388,6 +401,9 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
             "wait_timeout_minutes": int(r.get("wait_timeout_minutes", defaults.get("wait_timeout_minutes", 30))),
         })
 
+    for key in sorted(joined_bad_defaults - used_bad_defaults):
+        warnings.append(f"{bad_defaults[key]} (only inherited by create: false rooms, where it is ignored; "
+                        f"fix it before any room is switched to create: true)")
     errors = [bad_defaults[k] for k in sorted(used_bad_defaults)] + errors
     if errors:
         raise ConfigError("Invalid clean room config:\n  - " + "\n  - ".join(errors))
