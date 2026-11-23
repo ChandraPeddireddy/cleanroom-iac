@@ -9,6 +9,7 @@ This tool gives a Terraform-like workflow on top of the REST API: a config file 
 `plan` / `apply` / `drift` / `destroy`, idempotent re-runs and drift reporting.
 
 **Step-by-step rollout, permissions, test plan and CI/CD:** see [docs/IMPLEMENTATION_GUIDE.md](docs/IMPLEMENTATION_GUIDE.md).
+**Before the first dry run:** see [docs/PRE_SETUP.md](docs/PRE_SETUP.md) for the admin requests and setup commands.
 
 ## Files
 
@@ -17,6 +18,7 @@ This tool gives a Terraform-like workflow on top of the REST API: a config file 
 | `cleanroom_iac.py` | Engine (stdlib only). Plan/apply/drift/destroy, config validation, SDK and CLI transports, CLI entry point |
 | `cleanroom_iac_runner.py` | Databricks notebook that runs the engine as a job or interactively; `display()` output plus an optional Delta run log |
 | `config/cleanrooms.example.yaml` | Annotated example config |
+| `docs/PRE_SETUP.md` / `docs/CleanRooms_IaC_Pre_Setup.docx` | Pre-setup for the dry run: what to ask each admin for (with commands) and what you then do, using a service principal as owner |
 | `docs/CleanRooms_IaC_Implementation_Guide.docx` | Word copy of the guide. Regenerate after editing the Markdown: `python3 tools/md2docx.py docs/IMPLEMENTATION_GUIDE.md docs/CleanRooms_IaC_Implementation_Guide.docx "Clean Rooms as Code: Implementation and Test Guide"` |
 | `docs/IMPLEMENTATION_GUIDE.md` | Rollout guide: prerequisites, identity setup, jobs, test plan, CI/CD, Terraform coexistence, troubleshooting |
 | `tests/` | 108 offline tests: 91 for the engine against an in-memory fake API (`test_cleanroom_iac.py`, `test_cleanroom_iac_edges.py`, `test_config_types.py`, `test_preflight.py`) and 17 for the Word converter, including a schema-order check (`test_md2docx.py`) |

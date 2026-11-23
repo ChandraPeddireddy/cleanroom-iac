@@ -280,6 +280,7 @@ without a traceback), `2` drift found (`--mode drift`).
 ## 7. Test plan in your environment
 
 Run in **dev** with a throwaway room named `zz_cr_iac_smoke` and one small, non-sensitive table.
+For the admin requests and setup commands, see `docs/PRE_SETUP.md` (simple setup: the service principal is the owner).
 Record the result of every step. Don't onboard real rooms until T1–T12 pass.
 
 Run every live step **as the service principal** (the apply/drift jobs from section 6.2, or the CLI with
