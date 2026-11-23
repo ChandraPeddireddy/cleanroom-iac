@@ -103,13 +103,27 @@ def _value_error(key: str, value: str) -> Optional[str]:
     return None
 
 
-def _int_value(value: Any, what: str) -> Tuple[Optional[int], Optional[str]]:
-    """Parse an optional integer setting (int or digit string). Returns (value, error)."""
+def _int_value(value: Any, what: str, positive: bool = False) -> Tuple[Optional[int], Optional[str]]:
+    """Parse an optional whole-number setting: an int, a whole float (45.0) or an ASCII digit string
+    ("45"). Returns (value, error); empty -> (None, None). positive=True also requires > 0."""
     if value is None or (isinstance(value, str) and not value.strip()):
         return None, None
-    if isinstance(value, bool) or not (isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit())):
-        return None, f"{what} must be a whole number (got {value!r})"
-    return int(value), None
+    bad = f"{what} must be a whole number (got {value!r})"
+    if isinstance(value, bool):
+        return None, bad
+    if isinstance(value, float):
+        if not value.is_integer():
+            return None, bad
+        number = int(value)
+    elif isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+        number = int(value.strip())
+    else:
+        return None, bad
+    if positive and number <= 0:
+        return None, f"{what} must be greater than 0 (got {value!r})"
+    return number, None
 
 
 def _entries(room: dict, key: str, where: str, errors: List[str]) -> List[Any]:
@@ -214,8 +228,104 @@ def load_config_file(path: str) -> dict:
         return load_config_text(fh.read(), fmt)
 
 
+ROOM_TEXT_FIELDS = ("name", "comment", "owner", "local_alias", "output_catalog")
+DEFAULT_TEXT_FIELDS = ("owner",)
+LIST_SECTIONS = {  # room list setting -> text fields of each entry
+    "collaborators": ("alias", "global_metastore_id", "invite_recipient_email"),
+    "assets": ("type", "name", "local_name", "workspace_path", "description"),
+    "auto_approval_rules": ("author_alias", "author_scope", "runner_alias"),
+    "grants": ("principal",),
+}
+
+
+def _type_errors(raw: dict) -> List[str]:
+    """Check scalar value TYPES for the whole config in one pass, before any other validation logic
+    runs, so a wrong-typed value is reported instead of crashing. Shape problems (a section that is not
+    a list, an entry that is not a mapping), numbers, create, cloud_vendor and region are checked by the
+    main validation, which lists them together with all other errors."""
+    errs: List[str] = []
+
+    def text(d: dict, keys, where: str) -> None:
+        for k in keys:
+            v = d.get(k)
+            if v is not None and not isinstance(v, str):
+                hint = "; put it in quotes" if isinstance(v, (bool, int, float)) else ""
+                errs.append(f"{where}: '{k}' must be text (got {type(v).__name__} {v!r}){hint}")
+
+    def text_list(v: Any, where: str, k: str) -> None:
+        if v is None:
+            return
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            errs.append(f"{where}: '{k}' must be a list of text values (got {v!r})")
+
+    defaults = raw.get("defaults")
+    if defaults is not None and not isinstance(defaults, dict):
+        errs.append(f"'defaults' must be a mapping (got {type(defaults).__name__})")
+    elif defaults:
+        text(defaults, DEFAULT_TEXT_FIELDS, "defaults")
+    rooms = raw.get("clean_rooms")
+    if not isinstance(rooms, list):
+        return errs  # reported by the structural check
+    for i, r in enumerate(rooms):
+        if not isinstance(r, dict):
+            continue  # reported later as "must be a mapping"
+        name = r.get("name")
+        where = f"clean room '{name}'" if isinstance(name, str) and name else f"clean room '{i}'"
+        text(r, ROOM_TEXT_FIELDS, where)
+        shared_output = r.get("enable_shared_output")
+        if shared_output is not None and not isinstance(shared_output, bool):
+            # a quoted "false" would otherwise be sent as true
+            errs.append(f"{where}: 'enable_shared_output' must be true or false without quotes "
+                        f"(got {shared_output!r})")
+        egress = r.get("egress_network_policy")
+        if egress is not None and not isinstance(egress, dict):
+            errs.append(f"{where}: 'egress_network_policy' must be a mapping (got {type(egress).__name__})")
+        for section, fields in LIST_SECTIONS.items():
+            items = r.get(section)
+            if items is None:
+                continue
+            if not isinstance(items, list):
+                continue  # shape problem: reported by the main validation, together with other errors
+            for j, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue  # null entries / shape problems are handled by the main validation
+                at = f"{where}: {section}[{j}]"
+                text(item, fields, at)
+                if section == "assets":
+                    text_list(item.get("runner_aliases"), at, "runner_aliases")
+                    env = item.get("environment_version")
+                    if env is not None and (isinstance(env, bool) or not isinstance(env, (str, int, float))):
+                        errs.append(f"{at}: 'environment_version' must be text or a number (got {env!r})")
+                    parts = item.get("partitions")
+                    if parts is not None and not isinstance(parts, list):
+                        errs.append(f"{at}: 'partitions' must be a list (got {type(parts).__name__})")
+                if section == "grants":
+                    privs = item.get("privileges")
+                    if privs and isinstance(privs, list):  # a non-list is reported by the main validation
+                        text_list(privs, at, "privileges")
+    return errs
+
+
 def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
-    """Validate the config and return (rooms, warnings). Raises ConfigError listing every problem."""
+    """Validate the config and return (rooms, warnings). Raises ConfigError listing every problem.
+    Wrong value types are reported first (all of them); a malformed config never raises anything
+    other than ConfigError."""
+    if not isinstance(raw, dict):
+        raise ConfigError("Config root must be a mapping")
+    type_errors = _type_errors(raw)
+    if type_errors:
+        raise ConfigError("Invalid clean room config (wrong value types; fix these first):\n  - "
+                          + "\n  - ".join(type_errors))
+    try:
+        return _normalize_config(raw)
+    except ConfigError:
+        raise
+    except (TypeError, AttributeError, ValueError, KeyError) as e:  # safety net: never a traceback
+        raise ConfigError(f"Invalid clean room config: unexpected value ({type(e).__name__}: {e}). "
+                          f"Compare the field types with config/cleanrooms.example.yaml") from e
+
+
+def _normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
     errors: List[str] = []
     warnings: List[str] = []
     if not isinstance(raw, dict):
@@ -238,6 +348,10 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
         clean_defaults[key] = None if err else value
         if err:
             bad_defaults[key] = f"defaults: '{key}' {err}"
+
+    default_timeout, default_timeout_err = _int_value(defaults.get("wait_timeout_minutes"),
+                                                      "defaults: 'wait_timeout_minutes'", positive=True)
+    bad_default_timeout_used = False
 
     seen_rooms = set()
     rooms: List[dict] = []
@@ -286,7 +400,7 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
                               f"cloud:region:metastore-uuid (got {gmid!r})")
             email = c.get("invite_recipient_email")
             ws_id, ws_err = _int_value(c.get("invite_recipient_workspace_id"),
-                                       f"collaborator '{alias}' invite_recipient_workspace_id")
+                                       f"collaborator '{alias}' invite_recipient_workspace_id", positive=True)
             if ws_err:
                 errors.append(f"{where}: {ws_err}")
             elif email and not ws_id:
@@ -436,13 +550,15 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
                               f"or in defaults). Use a region Clean Rooms supports for that cloud; it can "
                               f"differ from your metastore's region (got {region!r})")
 
-        timeout_raw = r.get("wait_timeout_minutes")
-        if timeout_raw is None:
-            timeout_raw = defaults.get("wait_timeout_minutes", 30)
-        wait_timeout, timeout_err = _int_value(timeout_raw, "'wait_timeout_minutes'")
+        wait_timeout, timeout_err = _int_value(r.get("wait_timeout_minutes"), "'wait_timeout_minutes'",
+                                               positive=True)
         if timeout_err:
             errors.append(f"{where}: {timeout_err}")
-        wait_timeout = 30 if wait_timeout is None else wait_timeout
+            wait_timeout = 30
+        elif wait_timeout is None:  # not set (or empty) on the room: inherit from defaults
+            if default_timeout_err:
+                bad_default_timeout_used = True
+            wait_timeout = default_timeout or 30
 
         egress = r.get("egress_network_policy")
         rooms.append({
@@ -468,7 +584,10 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
     for key in sorted(joined_bad_defaults - used_bad_defaults):
         warnings.append(f"{bad_defaults[key]} (only inherited by create: false rooms, where it is ignored; "
                         f"fix it before any room is switched to create: true)")
-    errors = [bad_defaults[k] for k in sorted(used_bad_defaults)] + errors
+    if default_timeout_err and not bad_default_timeout_used:
+        warnings.append(f"{default_timeout_err} (no room inherits it right now; fix it before a room relies on it)")
+    errors = ([bad_defaults[k] for k in sorted(used_bad_defaults)]
+              + ([default_timeout_err] if bad_default_timeout_used else []) + errors)
     if errors:
         raise ConfigError("Invalid clean room config:\n  - " + "\n  - ".join(errors))
     return rooms, warnings
