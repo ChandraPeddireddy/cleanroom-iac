@@ -46,6 +46,7 @@ import json
 import posixpath
 import re
 import subprocess
+import sys
 import time
 import urllib.parse
 from dataclasses import dataclass, field, asdict
@@ -77,6 +78,17 @@ REGION_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")   # e.g. eastus, us-west-2, 
 
 SECURABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
 THREE_PART_RE = re.compile(r"^[^.\s]+\.[^.\s]+\.[^.\s]+$")
+
+# Pre-flight: source object types per declared asset type. Types in UNVERIFIED_SOURCE_TYPES can exist
+# but sharing them into a clean room has not been verified with this tool.
+EXPECTED_SOURCE_TYPES = {
+    "TABLE": {"MANAGED", "EXTERNAL", "MANAGED_SHALLOW_CLONE", "EXTERNAL_SHALLOW_CLONE"},
+    "VIEW": {"VIEW"},
+    "FOREIGN_TABLE": {"FOREIGN"},
+}
+UNVERIFIED_SOURCE_TYPES = {"STREAMING_TABLE", "MATERIALIZED_VIEW", "METRIC_VIEW"}
+PREFLIGHT = "PREFLIGHT"
+ALL_ROOMS = "(all rooms)"
 
 # Change actions
 CREATE, UPDATE, DELETE, REPLACE = "CREATE", "UPDATE", "DELETE", "REPLACE"
@@ -214,18 +226,28 @@ def cli_transport(profile: Optional[str] = None, cli: str = "databricks") -> Tra
 # --------------------------------------------------------------------------- #
 def load_config_text(text: str, fmt: str) -> dict:
     if fmt == "json":
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ConfigError(f"Config is not valid JSON: {e}") from e
     try:
         import yaml  # PyYAML ships with Databricks Runtime
     except ImportError as e:  # pragma: no cover
         raise ConfigError("PyYAML not available; use a .json config or %pip install pyyaml") from e
-    return yaml.safe_load(text)
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Config is not valid YAML: {e}") from e
 
 
 def load_config_file(path: str) -> dict:
     fmt = "json" if path.lower().endswith(".json") else "yaml"
-    with open(path, "r", encoding="utf-8") as fh:
-        return load_config_text(fh.read(), fmt)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as e:
+        raise ConfigError(f"Cannot read config file {path}: {e}") from e
+    return load_config_text(text, fmt)
 
 
 ROOM_TEXT_FIELDS = ("name", "comment", "owner", "local_alias", "output_catalog")
@@ -1093,14 +1115,132 @@ class CleanRoomManager:
                 + self._plan_rules(cfg, live, prune)
                 + self._plan_grants(cfg, live, prune))
 
+    # ---------------- pre-flight (read-only; warnings only; silent when OK) ----------------
+    def _me(self) -> dict:
+        if not hasattr(self, "_me_cache"):
+            self._me_cache = self.do("GET", "/api/2.0/preview/scim/v2/Me") or {}
+        return self._me_cache
+
+    def _check(self, out: List[Change], room: str, resource: str, fn: Callable[[], Optional[str]]) -> None:
+        """Run one check; a returned string becomes a non-blocking WARN. A failing check never breaks plan."""
+        try:
+            msg = fn()
+        except Exception as e:
+            msg = f"could not check ({e}); verify manually"
+        if msg:
+            out.append(Change(room, PREFLIGHT, resource, WARN, msg))
+
+    def _preflight_global(self, selected: List[dict]) -> List[Change]:
+        out: List[Change] = []
+
+        def delta_sharing() -> Optional[str]:
+            scope = self.metastore.get("delta_sharing_scope")
+            if scope != "INTERNAL_AND_EXTERNAL":
+                return (f"Metastore Delta Sharing scope is {scope!r}. Clean Rooms is built on Delta Sharing; "
+                        f"if creating a room fails, check that Delta Sharing is enabled for this metastore")
+            return None
+
+        def create_privilege() -> Optional[str]:
+            me = self._me()
+            user = me.get("userName")
+            ms_id = self.metastore.get("metastore_id")
+            if not user or not ms_id:
+                return "could not determine the run-as identity or metastore; verify CREATE_CLEAN_ROOM manually"
+            res = self.do("GET", f"/api/2.1/unity-catalog/effective-permissions/METASTORE/{_q(ms_id)}",
+                          query={"principal": user}) or {}
+            for assignment in res.get("privilege_assignments") or []:
+                if any(pr.get("privilege") == "CREATE_CLEAN_ROOM" for pr in assignment.get("privileges") or []):
+                    return None
+            owner = self.metastore.get("owner")
+            my_groups = {g.get("display") for g in me.get("groups") or []}
+            if owner and (owner == user or owner in my_groups):
+                return None  # metastore admin: implicit privileges are not listed
+            return (f"CREATE_CLEAN_ROOM on the metastore was not found for {user}. Creating a room needs it "
+                    f"(or metastore admin). Grants through nested groups may not be listed; verify if unsure")
+
+        self._check(out, ALL_ROOMS, "delta_sharing", delta_sharing)
+        if any(cfg["create"] for cfg in selected):
+            self._check(out, ALL_ROOMS, "CREATE_CLEAN_ROOM", create_privilege)
+        return out
+
+    def _owner_check(self, cfg: dict) -> Optional[str]:
+        owner = cfg["owner"]
+        me = self._me()
+        user = me.get("userName")
+        if owner == user:
+            return None
+        if "@" in owner:
+            return (f"owner is set to another user ({owner}). After the ownership transfer the run-as identity "
+                    f"({user}) can no longer manage this room; use a group that includes it")
+        flt = f'displayName eq "{owner}"'
+        res = self.do("GET", "/api/2.0/preview/scim/v2/Groups",
+                      query={"filter": flt, "attributes": "displayName,members"}) or {}
+        groups = res.get("Resources") or []
+        if not groups:
+            return (f"owner group '{owner}' was not found in this workspace (typo, or an account group not "
+                    f"assigned here), so membership of {user} could not be verified. The run-as identity must "
+                    f"be a member, or it loses control of the room after the ownership transfer")
+        members = {m.get("value") for m in groups[0].get("members") or []}
+        my_ids = {me.get("id")} | {g.get("value") for g in me.get("groups") or []}
+        if members & my_ids:
+            return None
+        return (f"{user} is not a direct member of owner group '{owner}' (or of a group listed in it). After the "
+                f"ownership transfer it would lose control of the room; add it to the group. Deeper nesting "
+                f"is not checked")
+
+    def _source_check(self, asset: dict) -> Optional[str]:
+        atype, local = asset["type"], asset["local_name"]
+        if atype == "VOLUME":
+            self.do("GET", f"/api/2.1/unity-catalog/volumes/{_q(local)}")
+            return None
+        info = self.do("GET", f"/api/2.1/unity-catalog/tables/{_q(local)}") or {}
+        table_type = info.get("table_type")
+        if table_type in UNVERIFIED_SOURCE_TYPES:
+            return (f"source {local} is a {table_type}. Sharing it as {atype} has not been verified with this "
+                    f"tool; check the result in the first apply")
+        if table_type and table_type not in EXPECTED_SOURCE_TYPES.get(atype, {table_type}):
+            return f"declared as {atype} but source {local} is a {table_type}; check the asset type"
+        return None
+
+    def _notebook_check(self, asset: dict) -> Optional[str]:
+        path = WorkspaceFileState._api_path(asset["workspace_path"])
+        info = self.do("GET", "/api/2.0/workspace/get-status", query={"path": path}) or {}
+        if info.get("object_type") != "NOTEBOOK":
+            return f"{asset['workspace_path']} is a {info.get('object_type')}, not a notebook"
+        return None
+
+    def _preflight_room(self, cfg: dict, live: Optional[dict]) -> List[Change]:
+        out: List[Change] = []
+        name = cfg["name"]
+        owner = cfg.get("owner")
+        transfer = owner and ((live is None and cfg["create"]) or (live is not None and live.get("owner") != owner))
+        if transfer:
+            self._check(out, name, "owner", lambda: self._owner_check(cfg))
+        for a in cfg["assets"]:
+            label = f"{a['type']} {a['name']}"
+            fn = (lambda a=a: self._notebook_check(a)) if a["type"] == NOTEBOOK else (lambda a=a: self._source_check(a))
+
+            def run(fn=fn, a=a):
+                try:
+                    return fn()
+                except ApiError as e:
+                    if e.not_found:
+                        where = a.get("workspace_path") or a.get("local_name")
+                        return f"source {where} was not found (or the run-as identity cannot see it)"
+                    raise
+            self._check(out, name, label, run)
+        return out
+
     # ---------------- public modes ----------------
     def plan(self, rooms: Optional[List[str]] = None, prune: bool = False,
              allow_replace: bool = False) -> List[Change]:
         self.state.load()
-        changes: List[Change] = []
-        for cfg in self._select(rooms):
+        selected = self._select(rooms)
+        changes: List[Change] = self._preflight_global(selected)
+        for cfg in selected:
             try:
                 live = self._get_room(cfg["name"])
+                changes += self._preflight_room(cfg, live)
                 room_changes = self._plan_room(cfg, live)
                 changes += room_changes
                 if any(c.blocking for c in room_changes):
@@ -1115,11 +1255,13 @@ class CleanRoomManager:
     def apply(self, rooms: Optional[List[str]] = None, prune: bool = False,
               allow_replace: bool = False) -> List[Change]:
         self.state.load()
-        results: List[Change] = []
-        for cfg in self._select(rooms):
+        selected = self._select(rooms)
+        results: List[Change] = self._preflight_global(selected)
+        for cfg in selected:
             name = cfg["name"]
             try:
                 live = self._get_room(name)
+                results += self._preflight_room(cfg, live)
                 room_changes = self._plan_room(cfg, live)
                 self._execute(room_changes)
                 results += room_changes
@@ -1219,6 +1361,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--confirm-destroy", default="")
     args = ap.parse_args(argv)
 
+    try:
+        return _run_cli(args)
+    except (ConfigError, ApiError) as e:  # expected failures: message only, no traceback
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+
+def _run_cli(args) -> int:
     rooms_cfg, warnings = normalize_config(load_config_file(args.config))
     for w in warnings:
         print("WARNING:", w)

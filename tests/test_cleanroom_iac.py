@@ -26,6 +26,14 @@ class FakeApi:
         self._rule_seq = 0
         self.fail_on = set()   # (method, path-prefix) pairs that should raise
         self.caller = "runner@corp.com"
+        # pre-flight data: defaults mean "everything OK", so existing scenarios produce no PREFLIGHT rows
+        self.caller_id = "id-runner"
+        self.caller_groups = []                 # [(id, display)]
+        self.metastore_privileges = ["CREATE_CLEAN_ROOM"]
+        self.sharing_scope = "INTERNAL_AND_EXTERNAL"
+        self.groups = None                      # None: any group exists and contains the caller
+        self.table_types = {}                   # full name -> table_type (default MANAGED)
+        self.missing_objects = set()
 
     def __call__(self, method, path, query=None, body=None):
         self.calls.append((method, path, query, body))
@@ -34,7 +42,26 @@ class FakeApi:
                 raise cr.ApiError(f"injected failure {method} {path}")
         parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")]
         if path == cr.METASTORE_SUMMARY_API:
-            return {"name": "ms", "global_metastore_id": LOCAL_GMID, "cloud": "azure", "region": "eastus2"}
+            return {"name": "ms", "global_metastore_id": LOCAL_GMID, "cloud": "azure", "region": "eastus2",
+                    "metastore_id": "ms-1", "owner": "metastore_admins", "delta_sharing_scope": self.sharing_scope}
+        if path == "/api/2.0/preview/scim/v2/Me":
+            return {"id": self.caller_id, "userName": self.caller,
+                    "groups": [{"value": gid, "display": d} for gid, d in self.caller_groups]}
+        if path == "/api/2.0/preview/scim/v2/Groups":
+            name = query["filter"].split('"')[1]
+            if self.groups is None:
+                return {"Resources": [{"displayName": name, "members": [{"value": self.caller_id}]}]}
+            if name not in self.groups:
+                return {"Resources": []}
+            return {"Resources": [{"displayName": name, "members": [{"value": v} for v in self.groups[name]]}]}
+        if path.startswith("/api/2.1/unity-catalog/effective-permissions/METASTORE/"):
+            return {"privilege_assignments": [{"principal": query["principal"],
+                                               "privileges": [{"privilege": p} for p in self.metastore_privileges]}]}
+        if path.startswith("/api/2.1/unity-catalog/tables/") or path.startswith("/api/2.1/unity-catalog/volumes/"):
+            full = urllib.parse.unquote(path.rsplit("/", 1)[1])
+            if full in self.missing_objects:
+                raise cr.ApiError(f"Table '{full}' does not exist.", not_found=True)
+            return {"full_name": full, "table_type": self.table_types.get(full, "MANAGED")}
         if path.startswith("/api/2.0/workspace/"):
             return self._workspace(method, parts[-1], query, body)
         if path.startswith(cr.UC_PERMISSIONS_API):
@@ -136,6 +163,10 @@ class FakeApi:
             return {}
         if op == "mkdirs":
             return {}
+        if op == "get-status":
+            if query["path"] not in self.files:
+                raise cr.ApiError(f"Path ({query['path']}) doesn't exist.", not_found=True)
+            return {"path": query["path"], "object_type": "NOTEBOOK"}
         raise AssertionError(op)
 
     def mutations(self):

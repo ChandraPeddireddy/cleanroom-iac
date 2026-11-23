@@ -318,9 +318,13 @@ class CliMainTests(unittest.TestCase):
         self.assertEqual(self.run_main("--mode", "apply")[0], 1)
 
     def test_destroy_via_cli_requires_confirmation(self):
+        import io
+        from contextlib import redirect_stderr
         self.run_main("--mode", "apply")
-        with self.assertRaises(cr.ConfigError):
-            self.run_main("--mode", "destroy")
+        err = io.StringIO()
+        with redirect_stderr(err):                       # clean message + exit 1, no traceback
+            self.assertEqual(self.run_main("--mode", "destroy")[0], 1)
+        self.assertIn("ERROR: Destroy not confirmed", err.getvalue())
         self.assertEqual(self.run_main("--mode", "destroy", "--confirm-destroy", "acme_partner")[0], 0)
 
     def test_json_and_yaml_loading(self):

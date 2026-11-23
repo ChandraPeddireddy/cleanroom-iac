@@ -19,7 +19,7 @@ This tool gives a Terraform-like workflow on top of the REST API: a config file 
 | `config/cleanrooms.example.yaml` | Annotated example config |
 | `docs/CleanRooms_IaC_Implementation_Guide.docx` | Word copy of the guide. Regenerate after editing the Markdown: `python3 tools/md2docx.py docs/IMPLEMENTATION_GUIDE.md docs/CleanRooms_IaC_Implementation_Guide.docx "Clean Rooms as Code: Implementation and Test Guide"` |
 | `docs/IMPLEMENTATION_GUIDE.md` | Rollout guide: prerequisites, identity setup, jobs, test plan, CI/CD, Terraform coexistence, troubleshooting |
-| `tests/` | 90 offline tests: 73 for the engine against an in-memory fake API (`test_cleanroom_iac.py`, `test_cleanroom_iac_edges.py`, `test_config_types.py`) and 17 for the Word converter, including a schema-order check (`test_md2docx.py`) |
+| `tests/` | 100 offline tests: 83 for the engine against an in-memory fake API (`test_cleanroom_iac.py`, `test_cleanroom_iac_edges.py`, `test_config_types.py`, `test_preflight.py`) and 17 for the Word converter, including a schema-order check (`test_md2docx.py`) |
 
 ## What it manages
 
@@ -86,7 +86,7 @@ deliberately. CLI exit codes: `0` success, `1` a change failed, `2` drift found 
 ## Verification status
 
 ### Verified offline
-90 unit tests (`tests/`): 73 run the engine against an in-memory fake of the APIs (including a check that wrong-typed values in any of 58 config fields never crash), 17 cover the Word converter. The engine tests cover:
+100 unit tests (`tests/`): 83 run the engine against an in-memory fake of the APIs (including a check that wrong-typed values in any of 58 config fields never crash, and the read-only pre-flight checks), 17 cover the Word converter. The engine tests cover:
 - create, including the owner transfer after ACTIVE
 - idempotent re-apply (zero writes)
 - updates, and drift on immutable settings (collaborators, region, egress, shared output)

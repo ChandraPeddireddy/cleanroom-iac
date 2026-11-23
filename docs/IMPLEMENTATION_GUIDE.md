@@ -202,6 +202,21 @@ Open `cleanroom_iac_runner` in the Git folder and set the widgets:
 
 Run all. Review the table: `CREATE` / `UPDATE` / `DELETE` = changes; `DRIFT` = needs a human; `WARN` = read the detail.
 
+**Pre-flight checks.** `plan` and `apply` also run read-only checks and add a `PREFLIGHT` / `WARN` row
+for each problem found (no rows when everything is fine). They never block: fix the cause, or confirm
+it's expected, before `apply`.
+
+| Check | Warns when |
+|---|---|
+| Delta Sharing | the metastore's Delta Sharing scope isn't `INTERNAL_AND_EXTERNAL` |
+| `CREATE_CLEAN_ROOM` | the run-as identity has no `CREATE_CLEAN_ROOM` on the metastore and isn't in the metastore owner group (only checked when a room is to be created) |
+| Owner group | ownership will change and the run-as identity isn't a direct member of the owner group (or of a group listed in it), the group isn't visible in the workspace, or the owner is a different user |
+| Shared tables, views, volumes | the source object doesn't exist or isn't visible, its type doesn't match the asset type, or it's a streaming table, materialized view or metric view (sharing those is unverified) |
+| Shared notebooks | the workspace path doesn't exist or isn't a notebook |
+
+Limits: grants through nested groups and deeper group nesting may not be visible, so treat those warnings
+as "verify", not as proof of a problem.
+
 ### 6.2 As jobs (all environments)
 
 Create two jobs per environment, both **serverless**, **run as** `sp-cleanroom-iac-<env>`,
@@ -259,7 +274,7 @@ Record the result of every step. Don't onboard real rooms until T1–T12 pass.
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-Expected: `OK` (90 tests; one YAML test is skipped if PyYAML isn't installed).
+Expected: `OK` (100 tests; one YAML test is skipped if PyYAML isn't installed).
 
 ### 7.1 Live smoke test
 
@@ -362,6 +377,8 @@ Then retire this repo.
 | `Timed out ... waiting for ... ACTIVE` | Slow provisioning | Raise `wait_timeout_minutes`; re-run apply (it resumes) |
 | Room shows `CREATE` although it existed | Room was deleted (status `DELETED`) | Expected: deleted rooms count as absent |
 | `ModuleNotFoundError: cleanroom_iac` | Notebook not run from the repo folder | Run the notebook from the Git folder that contains `cleanroom_iac.py` |
+| `PREFLIGHT` warning about the owner group | Run-as identity may not be in the owner group | Add the service principal to the owner group (section 3.3); if it's a member through nested groups, the warning can be ignored |
+| `PREFLIGHT` warning `... was not found` | Typo in `local_name` / `workspace_path`, or no access for the run-as identity | Fix the path, or grant access (section 3.2 / 3.4) |
 
 ---
 
@@ -380,7 +397,7 @@ Then retire this repo.
 
 | Area | Status |
 |---|---|
-| Engine logic (73 offline tests) | Tested |
+| Engine logic (83 offline tests) | Tested |
 | API paths and payloads (SDK 0.169.0 sources) | Checked against the source |
 | Plan, drift, destroy guard, state file, run log, serverless job run on Azure | Tested live (internal test workspace) |
 | Create request shape (owner, region and same-metastore rules) | Tested live, up to the authorization check |
