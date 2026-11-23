@@ -81,7 +81,8 @@ resource "terraform_data" "clean_rooms" {
 
 Limits of this pattern: `terraform plan` won't show clean room changes. Run
 `--mode plan` in the pipeline for that. Deletion isn't automatic, so use `--mode destroy`
-deliberately. CLI exit codes: `0` success, `1` a change failed, `2` drift found in `drift` mode.
+deliberately. CLI exit codes: `0` success, `1` a change failed or the config/an API call is invalid (printed as `ERROR: ...`),
+`2` drift found in `drift` mode.
 
 ## Verification status
 

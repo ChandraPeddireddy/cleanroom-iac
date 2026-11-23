@@ -124,7 +124,16 @@ cleanroom_iac.py            engine (stdlib only); also a CLI: python3 cleanroom_
 cleanroom_iac_runner        notebook entry point (widgets / job parameters)
 config/<env>.yaml           desired state per environment
 tests/                      offline unit tests (no workspace needed)
-docs/IMPLEMENTATION_GUIDE.md  this guide
+docs/IMPLEMENTATION_GUIDE.md  this guide (the source)
+docs/CleanRooms_IaC_Implementation_Guide.docx  Word copy of this guide
+tools/md2docx.py            regenerates the Word copy (stdlib only)
+```
+
+After editing this guide, regenerate the Word copy so the two don't drift apart:
+
+```bash
+python3 tools/md2docx.py docs/IMPLEMENTATION_GUIDE.md docs/CleanRooms_IaC_Implementation_Guide.docx \
+    "Clean Rooms as Code: Implementation and Test Guide"
 ```
 
 ---
@@ -175,6 +184,8 @@ Field rules:
 | `output_catalog` | Create once | Name can't change after creation |
 | `create: false` | n/a | Use for rooms a **partner** created. The tool then manages only your assets, rules and grants. Write it unquoted: a quoted `"false"` is rejected rather than read as true. While `create` is invalid the room is treated as join-only (nothing is created), so create-only checks appear after you fix it |
 | collaborator on the **same** metastore | n/a | Must also set `invite_recipient_email` and `invite_recipient_workspace_id` |
+| `wait_timeout_minutes` | Yes | Whole number greater than 0 (default 30), per room or in `defaults`. How long `apply` waits for a new room to become ACTIVE |
+| `owner` | Yes | A group (recommended), a user email, or a service principal's application ID. The run-as identity must be (in) the owner, or it loses control after the ownership transfer |
 
 `plan` validates the config first. Wrong value types (for example a list where a name is expected, or a
 quoted `"false"` for `enable_shared_output`) are listed together first; after those are fixed, it lists
@@ -261,7 +272,8 @@ python3 cleanroom_iac.py --config config/dev.yaml --mode apply --profile <profil
         --state-path /Workspace/Shared/cleanroom_iac/state/dev.json
 ```
 
-Exit codes: `0` OK, `1` a change failed, `2` drift found (`--mode drift`).
+Exit codes: `0` OK, `1` a change failed, or the config or an API call is invalid (printed as `ERROR: ...`,
+without a traceback), `2` drift found (`--mode drift`).
 
 ---
 
@@ -269,6 +281,10 @@ Exit codes: `0` OK, `1` a change failed, `2` drift found (`--mode drift`).
 
 Run in **dev** with a throwaway room named `zz_cr_iac_smoke` and one small, non-sensitive table.
 Record the result of every step. Don't onboard real rooms until T1–T12 pass.
+
+Run every live step **as the service principal** (the apply/drift jobs from section 6.2, or the CLI with
+the service principal's profile), not as a personal user. That's the identity production uses, and the
+pre-flight checks need it to give meaningful results.
 
 ### 7.0 Offline (any laptop or CI, no workspace)
 
@@ -283,7 +299,7 @@ Expected: `OK` (108 tests; one YAML test is skipped if PyYAML isn't installed).
 |---|---|---|---|---|
 | T1 | Preflight | Prerequisites P1–P6 | all as expected | [ ] |
 | T2 | Config validation | Put a typo in a collaborator metastore ID, run `plan` | run fails listing the error; nothing created | [ ] |
-| T3 | Plan | Correct config, `mode=plan` | room, asset, rule and grants show `CREATE`; nothing created (check `databricks clean-rooms list`) | [ ] |
+| T3 | Plan + pre-flight | Correct config, `mode=plan`, run as the service principal | room, asset, rule and grants show `CREATE`; nothing created (check `databricks clean-rooms list`). **No `PREFLIGHT` rows**, or each one resolved or confirmed as expected before T4 (section 6.1). Keep the output if a pre-flight warning looks wrong | [ ] |
 | T4 | Apply (create) | `mode=apply` | room reaches ACTIVE (several minutes); owner becomes the owner group; asset, rule and grants `APPLIED` | [ ] |
 | T5 | Idempotency | `mode=apply` again | every row `NOOP`/`SKIPPED`, no writes | [ ] |
 | T6 | Drift detection | In the UI, change the room comment, then `mode=drift`, `fail_on_drift=true` | job **fails** with "Drift detected"; the comment shows `UPDATE` | [ ] |
@@ -298,7 +314,8 @@ Expected: `OK` (108 tests; one YAML test is skipped if PyYAML isn't installed).
 
 | Question | How to test | Record |
 |---|---|---|
-| Can a **streaming table** or **materialized view** be shared, and with which `type`? | Add one as `type: TABLE`; if rejected, try `VIEW` | |
+| Do the pre-flight checks give correct results for a **service principal** run-as identity (`CREATE_CLEAN_ROOM`, owner group)? | T3: compare any `PREFLIGHT` warning with the real grants and group membership | |
+| Can a **streaming table** or **materialized view** be shared, and with which `type`? | Add one as `type: TABLE` (pre-flight flags it as unverified); if rejected, try `VIEW` | |
 | Does the partner see `T8` updates immediately, or does an approval apply? | Check from the partner workspace | |
 | What does `destroy` do for the partner's copy of the room? | Check the partner's clean room list after T12 | |
 | Does the owner transfer (T4) keep the service principal able to manage? | T5 must pass after T4 | |
@@ -377,6 +394,10 @@ Then retire this repo.
 | Room `WARN ... FAILED` | Provisioning failed | `destroy` that room, fix the cause, apply again |
 | `Timed out ... waiting for ... ACTIVE` | Slow provisioning | Raise `wait_timeout_minutes`; re-run apply (it resumes) |
 | Room shows `CREATE` although it existed | Room was deleted (status `DELETED`) | Expected: deleted rooms count as absent |
+| `'create' must be true or false without quotes` | `create: "false"` (quoted) or empty | Write `create: true` / `create: false` without quotes |
+| `wrong value types; fix these first` | A list or number where text is expected, `defaults` not a mapping, or a quoted `enable_shared_output` | Fix each listed field (quote numeric names such as `name: "2024"`); then re-run to see any remaining problems |
+| `must be a whole number` / `must be greater than 0` | Invalid `wait_timeout_minutes` or `invite_recipient_workspace_id` | Use a whole number greater than 0 |
+| `Cannot read config file` / `not valid YAML` / `not valid JSON` | Wrong path, file not UTF-8, or a syntax error | Fix the path, save the file as UTF-8, or fix the syntax at the reported line |
 | `ModuleNotFoundError: cleanroom_iac` | Notebook not run from the repo folder | Run the notebook from the Git folder that contains `cleanroom_iac.py` |
 | `PREFLIGHT` warning about the owner group | Run-as identity may not be in the owner group | Add the service principal to the owner group (section 3.3); if it's a member through nested groups, the warning can be ignored |
 | `PREFLIGHT` warning `... was not found` | Typo in `local_name` / `workspace_path`, or no access for the run-as identity | Fix the path, or grant access (section 3.2 / 3.4) |
@@ -402,4 +423,8 @@ Then retire this repo.
 | API paths and payloads (SDK 0.169.0 sources) | Checked against the source |
 | Plan, drift, destroy guard, state file, run log, serverless job run on Azure | Tested live (internal test workspace) |
 | Create request shape (owner, region and same-metastore rules) | Tested live, up to the authorization check |
+| Config validation: wrong-typed values in any of 58 config fields, quoted booleans, invalid numbers, unreadable files | Tested offline (never a traceback; always a config error) |
+| Pre-flight checks (Delta Sharing, `CREATE_CLEAN_ROOM`, owner group, source objects, notebook paths) | Tested live with a **user** run-as identity (internal test workspace) |
+| Pre-flight checks for a **service principal** run-as identity (application ID lookups) | Tested with the fake API only. Confirm in T3 |
+| Clean CLI errors (`ERROR: ...`, exit code 1) | Tested live |
 | Room create → ACTIVE, assets, rules, grants, notebook update, destroy | **Not tested live.** Section 7.1 is the first real test |
