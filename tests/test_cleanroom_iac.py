@@ -312,6 +312,69 @@ class ConfigValidationTests(unittest.TestCase):
             cr.normalize_config(cfg)
         self.assertEqual(str(ctx.exception).count("defaults: 'cloud_vendor'"), 1)
 
+    def test_create_must_be_a_real_boolean(self):
+        for bad in ("false", "true", "no", 0, 1, None):
+            with self.assertRaises(cr.ConfigError, msg=repr(bad)) as ctx:
+                cr.normalize_config(base_config(create=bad, collaborators=[]))
+            self.assertIn("'create' must be true or false without quotes", str(ctx.exception))
+        # an invalid value never turns into a create: no follow-on "collaborator required" noise
+        with self.assertRaises(cr.ConfigError) as ctx:
+            cr.normalize_config(base_config(create="false", collaborators=[], cloud_vendor=None, region=None))
+        self.assertNotIn("at least one other collaborator", str(ctx.exception))
+        self.assertNotIn("'region' of the central clean room is required", str(ctx.exception))
+        self.assertTrue(cr.normalize_config(base_config(create=True))[0][0]["create"])
+        self.assertFalse(cr.normalize_config(base_config(create=False, collaborators=[]))[0][0]["create"])
+
+    def test_bad_numbers_are_collected_not_raised(self):
+        cfg = base_config(wait_timeout_minutes="soon",
+                          collaborators=[{"alias": "partner", "global_metastore_id": PEER_GMID,
+                                          "invite_recipient_email": "a@b.com", "invite_recipient_workspace_id": "abc"}],
+                          assets=[{"type": "TABLE", "local_name": "two.parts"}])
+        with self.assertRaises(cr.ConfigError) as ctx:          # ConfigError, not ValueError
+            cr.normalize_config(cfg)
+        msg = str(ctx.exception)
+        self.assertIn("invite_recipient_workspace_id must be a whole number (got 'abc')", msg)
+        self.assertIn("'wait_timeout_minutes' must be a whole number (got 'soon')", msg)
+        self.assertIn("catalog.schema.object", msg)              # other problems still listed
+        with self.assertRaises(cr.ConfigError):
+            cr.normalize_config(base_config(wait_timeout_minutes=True))
+        room = cr.normalize_config(base_config(wait_timeout_minutes="45"))[0][0]
+        self.assertEqual(room["wait_timeout_minutes"], 45)
+        room = cr.normalize_config(base_config(wait_timeout_minutes=None))[0][0]
+        self.assertEqual(room["wait_timeout_minutes"], 30)
+
+    def test_malformed_entries_are_config_errors(self):
+        cases = {"collaborators": ["partner_a"], "assets": ["a.b.c"], "auto_approval_rules": ["r"],
+                 "grants": ["g"]}
+        for key, value in cases.items():
+            with self.assertRaises(cr.ConfigError, msg=key) as ctx:   # not AttributeError
+                cr.normalize_config(base_config(**{key: value}))
+            self.assertIn(f"{key}[0] must be a mapping", str(ctx.exception))
+        for key in ("collaborators", "assets", "auto_approval_rules", "grants"):
+            with self.assertRaises(cr.ConfigError, msg=key) as ctx:
+                cr.normalize_config(base_config(**{key: {"not": "a list"}}))
+            self.assertIn(f"'{key}' must be a list", str(ctx.exception))
+        with self.assertRaises(cr.ConfigError) as ctx:
+            cr.normalize_config(base_config(grants=[{"principal": "g", "privileges": "MODIFY_CLEAN_ROOM"}]))
+        self.assertIn("privileges must be a list", str(ctx.exception))
+        with self.assertRaises(cr.ConfigError) as ctx:                # null entry: same as before
+            cr.normalize_config(base_config(assets=[None]))
+        self.assertIn("type must be one of", str(ctx.exception))
+
+    def test_unused_bad_default_warns(self):
+        cfg = base_config()                                           # room sets its own cloud/region
+        cfg["defaults"] = {"region": "East US", "cloud_vendor": 5}
+        _, warnings = cr.normalize_config(cfg)
+        joined = " ".join(warnings)
+        self.assertIn("defaults: 'region' is not a valid region identifier", joined)
+        self.assertIn("defaults: 'cloud_vendor' must be a string", joined)
+        self.assertEqual(joined.count("no room inherits it right now"), 2)
+
+    def test_join_only_invalid_value_is_not_stored(self):
+        rooms, _ = cr.normalize_config(base_config(create=False, collaborators=[],
+                                                   cloud_vendor="azrue", region="East US"))
+        self.assertEqual((rooms[0]["cloud_vendor"], rooms[0]["region"]), (None, None))
+
     def test_misspelled_default_reported_once(self):
         cfg = base_config(cloud_vendor=None, region=None)
         for n in range(1, 6):

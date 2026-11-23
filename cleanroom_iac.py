@@ -103,6 +103,27 @@ def _value_error(key: str, value: str) -> Optional[str]:
     return None
 
 
+def _int_value(value: Any, what: str) -> Tuple[Optional[int], Optional[str]]:
+    """Parse an optional integer setting (int or digit string). Returns (value, error)."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, None
+    if isinstance(value, bool) or not (isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit())):
+        return None, f"{what} must be a whole number (got {value!r})"
+    return int(value), None
+
+
+def _entries(room: dict, key: str, where: str, errors: List[str]) -> List[Any]:
+    """The room's list setting (collaborators, assets, ...). A missing/null value is an empty list;
+    any other non-list value is reported as an error."""
+    value = room.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        errors.append(f"{where}: '{key}' must be a list (got {type(value).__name__})")
+        return []
+    return value
+
+
 def _setting(room: dict, clean_defaults: Dict[str, Optional[str]], key: str) -> Tuple[Optional[str], Optional[str]]:
     """Room value if set and non-empty, else the (already validated) defaults value.
     Returns (value, error); the error concerns the room's own value only."""
@@ -234,16 +255,26 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
             errors.append(f"{where}: duplicate clean room name")
         seen_rooms.add(name)
 
-        manage_room = bool(r.get("create", True))
+        create_raw = r.get("create", True)
+        if isinstance(create_raw, bool):
+            manage_room = create_raw
+        else:
+            # A quoted "false" would otherwise count as true and CREATE a room meant to be joined.
+            errors.append(f"{where}: 'create' must be true or false without quotes (got {create_raw!r})")
+            manage_room = False
         local_alias = r.get("local_alias")
         if not local_alias or not SECURABLE_NAME_RE.match(str(local_alias)):
             errors.append(f"{where}: 'local_alias' (this metastore's collaborator alias) is required")
 
         collabs = []
         aliases = {local_alias} if local_alias else set()
-        for j, c in enumerate(r.get("collaborators") or []):
-            alias = (c or {}).get("alias")
-            gmid = (c or {}).get("global_metastore_id")
+        for j, c in enumerate(_entries(r, "collaborators", where, errors)):
+            c = {} if c is None else c
+            if not isinstance(c, dict):
+                errors.append(f"{where}: collaborators[{j}] must be a mapping (got {c!r})")
+                continue
+            alias = c.get("alias")
+            gmid = c.get("global_metastore_id")
             if not alias or not SECURABLE_NAME_RE.match(str(alias)):
                 errors.append(f"{where}: collaborators[{j}].alias is required")
                 continue
@@ -254,13 +285,16 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
                 errors.append(f"{where}: collaborator '{alias}' global_metastore_id must look like "
                               f"cloud:region:metastore-uuid (got {gmid!r})")
             email = c.get("invite_recipient_email")
-            ws_id = c.get("invite_recipient_workspace_id")
-            if email and not ws_id:
+            ws_id, ws_err = _int_value(c.get("invite_recipient_workspace_id"),
+                                       f"collaborator '{alias}' invite_recipient_workspace_id")
+            if ws_err:
+                errors.append(f"{where}: {ws_err}")
+            elif email and not ws_id:
                 errors.append(f"{where}: collaborator '{alias}' sets invite_recipient_email, so "
                               f"invite_recipient_workspace_id is required too")
             collabs.append({"alias": alias, "global_metastore_id": gmid,
                             "invite_recipient_email": email,
-                            "invite_recipient_workspace_id": int(ws_id) if ws_id else None})
+                            "invite_recipient_workspace_id": ws_id})
         if manage_room and not collabs:
             errors.append(f"{where}: at least one other collaborator is required to create a clean room")
         # Join-only rooms may omit collaborators; alias references cannot be checked locally then.
@@ -271,8 +305,11 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
 
         assets = []
         seen_assets = set()
-        for j, a in enumerate(r.get("assets") or []):
-            a = a or {}
+        for j, a in enumerate(_entries(r, "assets", where, errors)):
+            a = {} if a is None else a
+            if not isinstance(a, dict):
+                errors.append(f"{where}: assets[{j}] must be a mapping (got {a!r})")
+                continue
             atype = str(a.get("type", "")).upper()
             aw = f"{where}: assets[{j}]"
             if atype not in SUPPORTED_ASSET_TYPES:
@@ -313,8 +350,11 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
             assets.append(asset)
 
         rules = []
-        for j, ru in enumerate(r.get("auto_approval_rules") or []):
-            ru = ru or {}
+        for j, ru in enumerate(_entries(r, "auto_approval_rules", where, errors)):
+            ru = {} if ru is None else ru
+            if not isinstance(ru, dict):
+                errors.append(f"{where}: auto_approval_rules[{j}] must be a mapping (got {ru!r})")
+                continue
             author = ru.get("author_alias")
             scope = ru.get("author_scope")
             runner = ru.get("runner_alias")
@@ -331,10 +371,18 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
             rules.append({"author_alias": author, "author_scope": scope, "runner_alias": runner})
 
         grants: Dict[str, List[str]] = {}
-        for j, g in enumerate(r.get("grants") or []):
-            g = g or {}
+        for j, g in enumerate(_entries(r, "grants", where, errors)):
+            g = {} if g is None else g
+            if not isinstance(g, dict):
+                errors.append(f"{where}: grants[{j}] must be a mapping (got {g!r})")
+                continue
             principal = g.get("principal")
-            privs = [str(p).upper().replace(" ", "_") for p in (g.get("privileges") or [])]
+            raw_privs = g.get("privileges") or []
+            if not isinstance(raw_privs, list):
+                # a bare string would otherwise be split into single characters
+                errors.append(f"{where}: grants[{j}].privileges must be a list (got {raw_privs!r})")
+                continue
+            privs = [str(p).upper().replace(" ", "_") for p in raw_privs]
             if not principal or not privs:
                 errors.append(f"{where}: grants[{j}] needs 'principal' and a non-empty 'privileges' list")
                 continue
@@ -356,15 +404,21 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
         region, region_err = _setting(r, clean_defaults, "region")
         if not manage_room:
             # Not used for join-only rooms, but surface typos before the room is ever switched to create: true.
+            invalid = set()
             for key, value, err in (("cloud_vendor", cloud_vendor, cloud_err), ("region", region, region_err)):
                 own_value = _clean_setting(r.get(key))[0]
                 if err:
                     warnings.append(f"{where}: {err} (ignored because create: false)")
+                    invalid.add(key)
                 elif own_value is not None and _value_error(key, own_value):
                     warnings.append(f"{where}: '{key}' {_value_error(key, own_value)} "
                                     f"(ignored because create: false)")
+                    invalid.add(key)
                 elif own_value is None and key in bad_defaults:
                     joined_bad_defaults.add(key)
+            # an invalid value is not kept (same as an invalid default)
+            cloud_vendor = None if "cloud_vendor" in invalid else cloud_vendor
+            region = None if "region" in invalid else region
         if manage_room:
             skip = set()
             for key, value, err in (("cloud_vendor", cloud_vendor, cloud_err), ("region", region, region_err)):
@@ -382,6 +436,14 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
                               f"or in defaults). Use a region Clean Rooms supports for that cloud; it can "
                               f"differ from your metastore's region (got {region!r})")
 
+        timeout_raw = r.get("wait_timeout_minutes")
+        if timeout_raw is None:
+            timeout_raw = defaults.get("wait_timeout_minutes", 30)
+        wait_timeout, timeout_err = _int_value(timeout_raw, "'wait_timeout_minutes'")
+        if timeout_err:
+            errors.append(f"{where}: {timeout_err}")
+        wait_timeout = 30 if wait_timeout is None else wait_timeout
+
         egress = r.get("egress_network_policy")
         rooms.append({
             "name": name,
@@ -398,9 +460,11 @@ def normalize_config(raw: dict) -> Tuple[List[dict], List[str]]:
             "assets": assets,
             "auto_approval_rules": rules,
             "grants": grants,
-            "wait_timeout_minutes": int(r.get("wait_timeout_minutes", defaults.get("wait_timeout_minutes", 30))),
+            "wait_timeout_minutes": wait_timeout,
         })
 
+    for key in sorted(set(bad_defaults) - used_bad_defaults - joined_bad_defaults):
+        warnings.append(f"{bad_defaults[key]} (no room inherits it right now; fix it before a room relies on it)")
     for key in sorted(joined_bad_defaults - used_bad_defaults):
         warnings.append(f"{bad_defaults[key]} (only inherited by create: false rooms, where it is ignored; "
                         f"fix it before any room is switched to create: true)")

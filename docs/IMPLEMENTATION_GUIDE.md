@@ -173,7 +173,7 @@ Field rules:
 | `comment`, `owner` | Yes | Updated by `apply` |
 | `assets`, `auto_approval_rules`, `grants` | Yes | Created, updated, or deleted (with `prune`) by `apply` |
 | `output_catalog` | Create once | Name can't change after creation |
-| `create: false` | n/a | Use for rooms a **partner** created. The tool then manages only your assets, rules and grants |
+| `create: false` | n/a | Use for rooms a **partner** created. The tool then manages only your assets, rules and grants. Write it unquoted: a quoted `"false"` is rejected rather than read as true |
 | collaborator on the **same** metastore | n/a | Must also set `invite_recipient_email` and `invite_recipient_workspace_id` |
 
 `plan` validates the config first and lists **every** problem in one error, for example a bad
@@ -257,7 +257,7 @@ Record the result of every step. Don't onboard real rooms until T1–T12 pass.
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-Expected: `OK` (78 tests; one YAML test is skipped if PyYAML isn't installed).
+Expected: `OK` (83 tests; one YAML test is skipped if PyYAML isn't installed).
 
 ### 7.1 Live smoke test
 
@@ -378,7 +378,7 @@ Then retire this repo.
 
 | Area | Status |
 |---|---|
-| Engine logic (61 offline tests) | Tested |
+| Engine logic (66 offline tests) | Tested |
 | API paths and payloads (SDK 0.169.0 sources) | Checked against the source |
 | Plan, drift, destroy guard, state file, run log, serverless job run on Azure | Tested live (internal test workspace) |
 | Create request shape (owner, region and same-metastore rules) | Tested live, up to the authorization check |
