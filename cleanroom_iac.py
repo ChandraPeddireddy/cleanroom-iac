@@ -74,6 +74,7 @@ KNOWN_CLEAN_ROOM_PRIVILEGES = {"MODIFY_CLEAN_ROOM", "EXECUTE_CLEAN_ROOM_TASK"}
 
 CLOUD_VENDORS = ("aws", "azure", "gcp")
 GLOBAL_METASTORE_ID_RE = re.compile(r"^(aws|azure|gcp):[a-z0-9-]+:[0-9a-f-]{36}$")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")  # SP application ID
 REGION_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")   # e.g. eastus, us-west-2, europe-west1
 
 SECURABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
@@ -245,7 +246,7 @@ def load_config_file(path: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             text = fh.read()
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         raise ConfigError(f"Cannot read config file {path}: {e}") from e
     return load_config_text(text, fmt)
 
@@ -706,6 +707,7 @@ class CleanRoomManager:
         self.poll_seconds = poll_seconds
         self._metastore: Optional[dict] = None
         self._nb_cache: Dict[str, Tuple[str, str]] = {}
+        self._pf_cache: Dict[Tuple, Tuple[bool, Any]] = {}
 
     # ---------------- helpers ----------------
     @property
@@ -1116,10 +1118,32 @@ class CleanRoomManager:
                 + self._plan_grants(cfg, live, prune))
 
     # ---------------- pre-flight (read-only; warnings only; silent when OK) ----------------
+    # Results are cached per run (including failures), so many rooms sharing an owner group or a
+    # source object cause one lookup each, and a failing lookup is not retried for every room.
+    def _cached(self, key: Tuple, fn: Callable[[], Any]) -> Any:
+        if key not in self._pf_cache:
+            try:
+                self._pf_cache[key] = (True, fn())
+            except Exception as e:
+                self._pf_cache[key] = (False, e)
+        ok, value = self._pf_cache[key]
+        if not ok:
+            raise value
+        return value
+
     def _me(self) -> dict:
-        if not hasattr(self, "_me_cache"):
-            self._me_cache = self.do("GET", "/api/2.0/preview/scim/v2/Me") or {}
-        return self._me_cache
+        return self._cached(("me",), lambda: self.do("GET", "/api/2.0/preview/scim/v2/Me") or {})
+
+    def _my_identities(self) -> List[str]:
+        """Names the run-as identity is known by: SCIM userName and, for a service principal, its
+        application ID (Unity Catalog identifies service principals by application ID)."""
+        me = self._me()
+        out = []
+        for key in ("applicationId", "userName"):
+            value = me.get(key)
+            if isinstance(value, str) and value and value not in out:
+                out.append(value)
+        return out
 
     def _check(self, out: List[Change], room: str, resource: str, fn: Callable[[], Optional[str]]) -> None:
         """Run one check; a returned string becomes a non-blocking WARN. A failing check never breaks plan."""
@@ -1132,68 +1156,84 @@ class CleanRoomManager:
 
     def _preflight_global(self, selected: List[dict]) -> List[Change]:
         out: List[Change] = []
+        if not any(cfg["create"] for cfg in selected):
+            return out  # both checks only matter when a room may be created
 
         def delta_sharing() -> Optional[str]:
             scope = self.metastore.get("delta_sharing_scope")
+            if scope is None:
+                return None  # not reported to this caller: unknown, so no warning
             if scope != "INTERNAL_AND_EXTERNAL":
                 return (f"Metastore Delta Sharing scope is {scope!r}. Clean Rooms is built on Delta Sharing; "
                         f"if creating a room fails, check that Delta Sharing is enabled for this metastore")
             return None
 
         def create_privilege() -> Optional[str]:
-            me = self._me()
-            user = me.get("userName")
+            names = self._my_identities()
             ms_id = self.metastore.get("metastore_id")
-            if not user or not ms_id:
+            if not names or not ms_id:
                 return "could not determine the run-as identity or metastore; verify CREATE_CLEAN_ROOM manually"
-            res = self.do("GET", f"/api/2.1/unity-catalog/effective-permissions/METASTORE/{_q(ms_id)}",
-                          query={"principal": user}) or {}
-            for assignment in res.get("privilege_assignments") or []:
-                if any(pr.get("privilege") == "CREATE_CLEAN_ROOM" for pr in assignment.get("privileges") or []):
-                    return None
+            for principal in names:  # application ID first for service principals, then userName
+                res = self.do("GET", f"/api/2.1/unity-catalog/effective-permissions/METASTORE/{_q(ms_id)}",
+                              query={"principal": principal}) or {}
+                for assignment in res.get("privilege_assignments") or []:
+                    if any(pr.get("privilege") == "CREATE_CLEAN_ROOM" for pr in assignment.get("privileges") or []):
+                        return None
             owner = self.metastore.get("owner")
-            my_groups = {g.get("display") for g in me.get("groups") or []}
-            if owner and (owner == user or owner in my_groups):
+            my_groups = {g.get("display") for g in self._me().get("groups") or []}
+            if owner and (owner in names or owner in my_groups):
                 return None  # metastore admin: implicit privileges are not listed
-            return (f"CREATE_CLEAN_ROOM on the metastore was not found for {user}. Creating a room needs it "
+            return (f"CREATE_CLEAN_ROOM on the metastore was not found for {names[0]}. Creating a room needs it "
                     f"(or metastore admin). Grants through nested groups may not be listed; verify if unsure")
 
         self._check(out, ALL_ROOMS, "delta_sharing", delta_sharing)
-        if any(cfg["create"] for cfg in selected):
-            self._check(out, ALL_ROOMS, "CREATE_CLEAN_ROOM", create_privilege)
+        self._check(out, ALL_ROOMS, "CREATE_CLEAN_ROOM", create_privilege)
         return out
+
+    def _find_group(self, owner: str) -> Optional[dict]:
+        def lookup():
+            escaped = owner.replace("\\", "\\\\").replace('"', '\\"')
+            res = self.do("GET", "/api/2.0/preview/scim/v2/Groups",
+                          query={"filter": f'displayName eq "{escaped}"', "attributes": "displayName,members"}) or {}
+            groups = res.get("Resources") or []
+            exact = [g for g in groups if g.get("displayName") == owner]
+            folded = [g for g in groups if str(g.get("displayName", "")).lower() == owner.lower()]
+            return (exact or folded or [None])[0]
+        return self._cached(("group", owner), lookup)
 
     def _owner_check(self, cfg: dict) -> Optional[str]:
         owner = cfg["owner"]
-        me = self._me()
-        user = me.get("userName")
-        if owner == user:
+        names = self._my_identities()
+        who = names[0] if names else "the run-as identity"
+        if owner.lower() in {n.lower() for n in names}:
             return None
         if "@" in owner:
-            return (f"owner is set to another user ({owner}). After the ownership transfer the run-as identity "
-                    f"({user}) can no longer manage this room; use a group that includes it")
-        flt = f'displayName eq "{owner}"'
-        res = self.do("GET", "/api/2.0/preview/scim/v2/Groups",
-                      query={"filter": flt, "attributes": "displayName,members"}) or {}
-        groups = res.get("Resources") or []
-        if not groups:
+            return (f"owner is set to another user ({owner}). After the ownership transfer {who} can no longer "
+                    f"manage this room; use a group that includes it")
+        if UUID_RE.match(owner):
+            return (f"owner is set to another service principal ({owner}). After the ownership transfer {who} "
+                    f"can no longer manage this room; use a group that includes it")
+        group = self._find_group(owner)
+        if group is None:
             return (f"owner group '{owner}' was not found in this workspace (typo, or an account group not "
-                    f"assigned here), so membership of {user} could not be verified. The run-as identity must "
+                    f"assigned here), so membership of {who} could not be verified. The run-as identity must "
                     f"be a member, or it loses control of the room after the ownership transfer")
-        members = {m.get("value") for m in groups[0].get("members") or []}
+        me = self._me()
+        members = {m.get("value") for m in group.get("members") or []}
         my_ids = {me.get("id")} | {g.get("value") for g in me.get("groups") or []}
         if members & my_ids:
             return None
-        return (f"{user} is not a direct member of owner group '{owner}' (or of a group listed in it). After the "
+        return (f"{who} is not a direct member of owner group '{owner}' (or of a group listed in it). After the "
                 f"ownership transfer it would lose control of the room; add it to the group. Deeper nesting "
                 f"is not checked")
 
     def _source_check(self, asset: dict) -> Optional[str]:
         atype, local = asset["type"], asset["local_name"]
         if atype == "VOLUME":
-            self.do("GET", f"/api/2.1/unity-catalog/volumes/{_q(local)}")
+            self._cached(("volume", local), lambda: self.do("GET", f"/api/2.1/unity-catalog/volumes/{_q(local)}"))
             return None
-        info = self.do("GET", f"/api/2.1/unity-catalog/tables/{_q(local)}") or {}
+        info = self._cached(("table", local),
+                            lambda: self.do("GET", f"/api/2.1/unity-catalog/tables/{_q(local)}") or {})
         table_type = info.get("table_type")
         if table_type in UNVERIFIED_SOURCE_TYPES:
             return (f"source {local} is a {table_type}. Sharing it as {atype} has not been verified with this "
@@ -1204,7 +1244,8 @@ class CleanRoomManager:
 
     def _notebook_check(self, asset: dict) -> Optional[str]:
         path = WorkspaceFileState._api_path(asset["workspace_path"])
-        info = self.do("GET", "/api/2.0/workspace/get-status", query={"path": path}) or {}
+        info = self._cached(("notebook", path), lambda: self.do("GET", "/api/2.0/workspace/get-status",
+                                                                query={"path": path}) or {})
         if info.get("object_type") != "NOTEBOOK":
             return f"{asset['workspace_path']} is a {info.get('object_type')}, not a notebook"
         return None
@@ -1240,11 +1281,11 @@ class CleanRoomManager:
         for cfg in selected:
             try:
                 live = self._get_room(cfg["name"])
-                changes += self._preflight_room(cfg, live)
                 room_changes = self._plan_room(cfg, live)
-                changes += room_changes
                 if any(c.blocking for c in room_changes):
+                    changes += room_changes  # nothing will be applied: no pre-flight noise
                     continue
+                changes += self._preflight_room(cfg, live) + room_changes
                 changes += self._plan_children(cfg, live if live and live.get("status") == "ACTIVE" else None,
                                                prune, allow_replace)
             except Exception as e:  # one bad room must not hide the others
@@ -1256,13 +1297,14 @@ class CleanRoomManager:
               allow_replace: bool = False) -> List[Change]:
         self.state.load()
         selected = self._select(rooms)
-        results: List[Change] = self._preflight_global(selected)
+        results: List[Change] = self._skipped(self._preflight_global(selected))
         for cfg in selected:
             name = cfg["name"]
             try:
                 live = self._get_room(name)
-                results += self._preflight_room(cfg, live)
                 room_changes = self._plan_room(cfg, live)
+                if not any(c.blocking for c in room_changes):
+                    results += self._skipped(self._preflight_room(cfg, live))
                 self._execute(room_changes)
                 results += room_changes
                 if any(c.status == "FAILED" for c in room_changes):
@@ -1313,6 +1355,12 @@ class CleanRoomManager:
             results.append(c)
         self.state.save()
         return results
+
+    @staticmethod
+    def _skipped(changes: List[Change]) -> List[Change]:
+        for c in changes:
+            c.status = "SKIPPED"
+        return changes
 
     def _execute(self, changes: List[Change]) -> None:
         for c in changes:

@@ -208,14 +208,15 @@ it's expected, before `apply`.
 
 | Check | Warns when |
 |---|---|
-| Delta Sharing | the metastore's Delta Sharing scope isn't `INTERNAL_AND_EXTERNAL` |
-| `CREATE_CLEAN_ROOM` | the run-as identity has no `CREATE_CLEAN_ROOM` on the metastore and isn't in the metastore owner group (only checked when a room is to be created) |
-| Owner group | ownership will change and the run-as identity isn't a direct member of the owner group (or of a group listed in it), the group isn't visible in the workspace, or the owner is a different user |
+| Delta Sharing | a room is to be created and the metastore reports a Delta Sharing scope other than `INTERNAL_AND_EXTERNAL` (no warning if the scope isn't reported) |
+| `CREATE_CLEAN_ROOM` | the run-as identity (looked up by application ID for a service principal, then by user name) has no `CREATE_CLEAN_ROOM` on the metastore and isn't in the metastore owner group (only checked when a room is to be created) |
+| Owner | ownership will change and the run-as identity isn't a direct member of the owner group (or of a group listed in it), the group isn't visible in the workspace, or the owner is a different user or service principal (application ID). An owner that is the run-as identity itself is fine; emails are compared case-insensitively |
 | Shared tables, views, volumes | the source object doesn't exist or isn't visible, its type doesn't match the asset type, or it's a streaming table, materialized view or metric view (sharing those is unverified) |
 | Shared notebooks | the workspace path doesn't exist or isn't a notebook |
 
-Limits: grants through nested groups and deeper group nesting may not be visible, so treat those warnings
-as "verify", not as proof of a problem.
+Rooms whose plan is already blocked (for example a FAILED room) are not checked. Lookups are made once per
+run. Limits: grants through nested groups and deeper group nesting may not be visible, so treat those
+warnings as "verify", not as proof of a problem.
 
 ### 6.2 As jobs (all environments)
 
@@ -274,7 +275,7 @@ Record the result of every step. Don't onboard real rooms until T1–T12 pass.
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-Expected: `OK` (100 tests; one YAML test is skipped if PyYAML isn't installed).
+Expected: `OK` (108 tests; one YAML test is skipped if PyYAML isn't installed).
 
 ### 7.1 Live smoke test
 
@@ -397,7 +398,7 @@ Then retire this repo.
 
 | Area | Status |
 |---|---|
-| Engine logic (83 offline tests) | Tested |
+| Engine logic (91 offline tests) | Tested |
 | API paths and payloads (SDK 0.169.0 sources) | Checked against the source |
 | Plan, drift, destroy guard, state file, run log, serverless job run on Azure | Tested live (internal test workspace) |
 | Create request shape (owner, region and same-metastore rules) | Tested live, up to the authorization check |

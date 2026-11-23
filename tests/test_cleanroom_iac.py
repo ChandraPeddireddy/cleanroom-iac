@@ -34,6 +34,9 @@ class FakeApi:
         self.groups = None                      # None: any group exists and contains the caller
         self.table_types = {}                   # full name -> table_type (default MANAGED)
         self.missing_objects = set()
+        self.caller_app_id = None               # set to simulate a service principal run-as identity
+        self.privileged_principals = None       # None: any principal holds metastore_privileges
+        self.group_results = {}                 # group name -> raw SCIM Resources list (overrides groups)
 
     def __call__(self, method, path, query=None, body=None):
         self.calls.append((method, path, query, body))
@@ -45,16 +48,23 @@ class FakeApi:
             return {"name": "ms", "global_metastore_id": LOCAL_GMID, "cloud": "azure", "region": "eastus2",
                     "metastore_id": "ms-1", "owner": "metastore_admins", "delta_sharing_scope": self.sharing_scope}
         if path == "/api/2.0/preview/scim/v2/Me":
-            return {"id": self.caller_id, "userName": self.caller,
-                    "groups": [{"value": gid, "display": d} for gid, d in self.caller_groups]}
+            me = {"id": self.caller_id, "userName": self.caller,
+                  "groups": [{"value": gid, "display": d} for gid, d in self.caller_groups]}
+            if self.caller_app_id:
+                me["applicationId"] = self.caller_app_id
+            return me
         if path == "/api/2.0/preview/scim/v2/Groups":
-            name = query["filter"].split('"')[1]
+            name = query["filter"][len('displayName eq "'):-1].replace('\\"', '"').replace("\\\\", "\\")
+            if name in self.group_results:
+                return {"Resources": self.group_results[name]}
             if self.groups is None:
                 return {"Resources": [{"displayName": name, "members": [{"value": self.caller_id}]}]}
             if name not in self.groups:
                 return {"Resources": []}
             return {"Resources": [{"displayName": name, "members": [{"value": v} for v in self.groups[name]]}]}
         if path.startswith("/api/2.1/unity-catalog/effective-permissions/METASTORE/"):
+            if self.privileged_principals is not None and query["principal"] not in self.privileged_principals:
+                return {"privilege_assignments": []}
             return {"privilege_assignments": [{"principal": query["principal"],
                                                "privileges": [{"privilege": p} for p in self.metastore_privileges]}]}
         if path.startswith("/api/2.1/unity-catalog/tables/") or path.startswith("/api/2.1/unity-catalog/volumes/"):
